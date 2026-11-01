@@ -186,6 +186,56 @@ preload_model_async :: proc() {
 	}
 }
 
+// A dictation ends where the speech ends. The room tone after the last word is
+// fed to the encoder as real frames, and encoder frames are what a dictation
+// costs: on the 1.056 s benchmark clip (466 ms of trailing silence) the trim
+// takes inference from 322 ms to ~255 ms. A pad is kept after the last speech
+// frame so the acoustic model still sees an endpoint, and clips whose tail is
+// shorter than TRIM_MIN_CUT_MS are sent untouched.
+TRIM_TAIL_PAD_MS :: 250
+TRIM_MIN_CUT_MS :: 100
+TRIM_FRAME_MS :: 20
+// A frame is speech when its mean square is above this fraction of the loudest
+// frame (-30 dB), and only runs of at least TRIM_RUN_FRAMES count: a keyboard
+// click or a mouse button 300 ms after the last syllable is 40 ms of wideband
+// noise and must not hold 200 ms of trailing silence alive.
+TRIM_REL_FLOOR :: 0.001
+TRIM_RUN_FRAMES :: 5
+
+trim_trailing_silence :: proc(samples: []f32) -> (out: []f32, trimmed_ms: int) {
+	out = samples
+	rate := 16_000
+	frame := rate * TRIM_FRAME_MS / 1000
+	if len(samples) < frame * 8 { return }
+	peak_ms: f32 = 0
+	frames := (len(samples) + frame - 1) / frame
+	energy := make([]f32, frames, context.temp_allocator) or_else nil
+	if energy == nil { return }
+	for i in 0 ..< frames {
+		off := i * frame
+		acc: f32 = 0
+		for s in samples[off:min(off + frame, len(samples))] { acc += s * s }
+		energy[i] = acc / f32(frame)
+		if energy[i] > peak_ms { peak_ms = energy[i] }
+	}
+	if peak_ms < 1e-8 { return }
+	limit := peak_ms * f32(TRIM_REL_FLOOR)
+	last := 0
+	run := 0
+	for i in 0 ..< frames {
+		if energy[i] > limit {
+			if run += 1; run >= TRIM_RUN_FRAMES { last = (i + 1) * frame }
+		} else {
+			run = 0
+		}
+	}
+	keep := min(last + rate * TRIM_TAIL_PAD_MS / 1000, len(samples))
+	cut := len(samples) - keep
+	if cut < rate * TRIM_MIN_CUT_MS / 1000 { return }
+	trimmed_ms = cut * 1000 / rate
+	return samples[:keep], trimmed_ms
+}
+
 transcribe_run :: proc(model_id: string, samples: []f32, language := "") -> (text: string, err: string) {
 	if !transcribe_available() {
 		return "", strings.clone("transcribe shim not built (scripts/build-native.ps1)")
@@ -199,6 +249,7 @@ transcribe_run :: proc(model_id: string, samples: []f32, language := "") -> (tex
 	if ok, e := model_ensure_locked(&cfg, model_id); !ok { return "", e }
 	model_last = time.now()
 
+	samples, trimmed_ms := trim_trailing_silence(samples)
 	use_lang := language if len(language) > 0 else cfg.language
 	lang := strings.clone_to_cstring(use_lang, context.temp_allocator)
 	t_asr := time.tick_now()
@@ -211,8 +262,8 @@ transcribe_run :: proc(model_id: string, samples: []f32, language := "") -> (tex
 	if res != nil {
 		wait_ms := time.duration_milliseconds(time.tick_since(t_model))
 		infer_ms := time.duration_milliseconds(time.tick_since(t_asr))
-		log_write("[hex] asr: model-wait %.0f ms, inference %.0f ms (%d samples)",
-			wait_ms, infer_ms, len(samples))
+		log_write("[hex] asr: model-wait %.0f ms, inference %.0f ms (%d samples, %d ms tail trimmed)",
+			wait_ms, infer_ms, len(samples), trimmed_ms)
 		// Same numbers on stderr for the benchmark harness (autoresearch.sh),
 		// which cannot read the log file reliably. Off unless asked for.
 		if len(os.get_env("HEX_PROFILE", context.temp_allocator)) > 0 {
