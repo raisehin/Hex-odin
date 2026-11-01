@@ -1,0 +1,17 @@
+[
+  {
+    "family": "parakeet",
+    "repo": "",
+    "revision": "da200358d638886bc96c758c672ad5568828b119",
+    "languages": "en",
+    "streams": false,
+    "curated": true,
+    "id": "phonon25_en",
+    "name": "Phonon-2.5 English Q8_0",
+    "description": "Fermion Phonon-2.5 English, 0.6B TDT. Built locally via scripts/convert-phonon25.py",
+    "filename": "phonon-2.5-en-Q8_0.gguf",
+    "bytes": 739508608,
+    "sha256": "a7c32cae47157a9da95730963f5efa9d6e2f9bd4f7203887fe50ee4ce75aba5f",
+    "realtime": "~12x"
+  }
+]

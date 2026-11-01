@@ -1,0 +1,63 @@
+# Build output
+/hex.exe
+/hex.pdb
+*.exe
+*.o
+*.obj
+*.lib
+*.dll
+*.so
+*.dylib
+*.exp
+*.ilk
+*.ll
+
+# Generated resources (scripts/make-icon.py + rc.exe, from Hex.png)
+/hex.ico
+/hex.rc
+/hex.res
+
+# Native shim and cmake trees (built by scripts/build-native.ps1)
+/native/build/
+/native/build-*/
+/native/bin/
+/native/third_party/
+/native/build-transcribe.log
+
+# Third-party source drops kept for reading only
+/phonon-rs-master/
+
+# Models and archives (real home is %APPDATA%\hex\models)
+*.gguf
+*.bps.tar.zst
+*.zst
+*.bin
+
+# Test audio and captures
+*.mp3
+*.wav
+*.png
+!/Hex.png
+
+# Local logs
+*.log
+
+# Scratch and notes
+/.swarm/
+/esctest.ps1
+/send.ps1
+
+# Python tooling leftovers
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
