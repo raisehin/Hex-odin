@@ -125,6 +125,18 @@ model_idle_worker :: proc(_: ^thread.Thread) {
 	}
 }
 
+// ggml's thread pool spins between graph nodes, so handing it every logical CPU
+// on an SMT part oversubscribes the physical cores: measured on a 4C/8T Zen2,
+// 8 threads ran the 1 s clip at 459 ms median (up to 1.7 s) versus 353 ms at 6,
+// and one core at 8 threads costs 2-3x. Three quarters of the logical count
+// leaves one SMT sibling free per physical core; 0 keeps meaning "auto".
+worker_threads :: proc(want: int) -> int {
+	if want > 0 { return want }
+	n := logical_cpu_count()
+	if n <= 2 { return n }
+	return n - n / 4
+}
+
 // Init is 890 ms cold (measured) and the idle worker hands the session back
 // after MODEL_IDLE_SECONDS, so the wait used to land between the key release
 // and the paste. Preloading on the key down overlaps it with the recording.
@@ -135,7 +147,7 @@ model_ensure_locked :: proc(cfg: ^Config, model_id: string) -> (ok: bool, err: s
 	path := model_path(cfg, model_id)
 	if path == "" { return false, fmt.aprintf("unknown model: %s", model_id) }
 	if !file_exists(path) { return false, fmt.aprintf("model not installed: %s", path) }
-	if shim.set_threads != nil { shim.set_threads(i32(cfg.threads)) }
+	if shim.set_threads != nil { shim.set_threads(i32(worker_threads(cfg.threads))) }
 	init := shim.init(strings.clone_to_cstring(path, context.temp_allocator))
 	if init != 0 {
 		if detail := shim_error_text(); len(detail) > 0 {

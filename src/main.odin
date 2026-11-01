@@ -103,6 +103,11 @@ cmd_threads :: proc(args: []string) {
 }
 
 cmd_vad :: proc(path: string) {
+	// Windows 11 may hold the process under EcoQoS, which caps clocks; the HUD
+	// clears it while recording, and the CLI has to do the same before the ASR
+	// runs. Measured on this box it is the difference between a stable ~350 ms
+	// and swings up to 1.7 s.
+	power_eco(false)
 	samples, _, ok := wav_read_mono16k(path)
 	if !ok { fmt.eprintln("could not read", path); os.exit(1) }
 	if !vad_load() { fmt.eprintln("vad model missing (silero-vad-v6.2-F32.gguf)"); os.exit(1) }
@@ -237,6 +242,11 @@ cmd_transcribe :: proc(path: string, model_id := "", language := "") {
 		fmt.eprintln("transcribe shim not built — run scripts/build-native.ps1")
 		os.exit(1)
 	}
+	// Windows 11 may hold the process under EcoQoS, which caps clocks; the HUD
+	// clears it while recording, and the CLI has to do the same before the ASR
+	// runs. Measured on this box it is the difference between a stable ~350 ms
+	// and swings up to 1.7 s.
+	power_eco(false)
 	samples, _, ok := wav_read_mono16k(path)
 	if !ok {
 		fmt.eprintln("could not read", path)
