@@ -10,11 +10,8 @@
 # =============================================================================
 
 # Build output ---------------------------------------------------------------
-/hex.exe
-/hex.pdb
-/hex.res
-/hex.rc
-/hex.ico
+# build.ps1 writes the exe, its PDB, the icon intermediates and the shim here.
+/bin/
 *.exe
 *.pdb
 *.o

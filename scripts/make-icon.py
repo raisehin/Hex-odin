@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Rebuild hex.ico (and hex.rc) from Hex.png.
 
-    python scripts/make-icon.py                 # hex.ico + hex.rc
-    rc.exe /nologo /fo hex.res hex.rc           # then the .res build.ps1 links
+    python scripts/make-icon.py                 # bin/hex.ico + bin/hex.rc
+    rc.exe /nologo /fo bin/hex.res bin/hex.rc   # then the .res build.ps1 links
 
 Hex.png is the source of truth for the app icon. It is black line art on a
 transparent 500x500 canvas, so it cannot be used as-is:
@@ -24,8 +24,9 @@ from PIL import Image, ImageDraw, ImageFilter
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "Hex.png"
-ICON = ROOT / "hex.ico"
-RC = ROOT / "hex.rc"
+BIN = ROOT / "bin"
+ICON = BIN / "hex.ico"
+RC = BIN / "hex.rc"
 
 SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256]
 
@@ -79,6 +80,7 @@ def main() -> int:
         print(f"missing source image: {SOURCE}", file=sys.stderr)
         return 1
 
+    BIN.mkdir(exist_ok=True)
     frames = [tile(s) for s in SIZES]
     frames[-1].save(
         ICON,

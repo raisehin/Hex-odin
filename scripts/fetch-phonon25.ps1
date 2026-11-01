@@ -68,7 +68,7 @@ if ($Install) {
     New-Item -ItemType Directory -Force -Path $models | Out-Null
     Copy-Item $out (Join-Path $models (Split-Path $out -Leaf)) -Force
     Write-Host "installed into $models" -ForegroundColor Green
-    Write-Host "run: .\hex.exe models list | findstr phonon"
+    Write-Host "run: .\bin\hex.exe models list | findstr phonon"
 }
 
 Write-Host "done: $out" -ForegroundColor Green

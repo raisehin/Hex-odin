@@ -60,7 +60,7 @@ dictation costs ~400 MB for its duration and nothing while you are not using it.
 ## Build
 
 ```powershell
-# Odin app (~5 s)
+# Odin app (~5 s): bin\hex.exe
 .\build.ps1                 # debug
 .\build.ps1 -Release
 
@@ -68,7 +68,7 @@ dictation costs ~400 MB for its duration and nothing while you are not using it.
 cmake -S native/third_party/transcribe.cpp -B native/build-transcribe -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=OFF
 cmake --build native/build-transcribe --config Release --parallel
 
-# Shim, linked against those static libs, copied next to hex.exe
+# Shim, linked against those static libs, copied next to the exe in bin\
 .\build.ps1 -Release -Native
 ```
 
@@ -78,8 +78,12 @@ not installed here; CPU is the default.
 If `native/build-transcribe/.../transcribe.lib` is missing, the shim builds
 anyway (stub) so the app stays runnable.
 
-Odin lives at `C:\Users\rhais\Downloads\odin-windows-amd64-dev-2026-10`
-(`dist\odin.exe`, dev-2026-10-nightly).
+`build.ps1` finds the Odin compiler from `-Odin <path>`, then `$env:ODIN`, then
+`PATH`, then the usual install directories (`<dir>\dist\odin.exe`, as release
+archives unpack). Everything it emits - the exe, its PDB, the icon
+intermediates and the shim DLL - lands in `bin\`, which `.gitignore` covers.
+Any Odin dev build from 2026-10 or later works; that is the one this was
+measured with.
 
 ## Use
  ```powershell

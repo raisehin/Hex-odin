@@ -1,11 +1,13 @@
-# Creates Desktop + Start Menu shortcuts for hex.exe, and a dot-scope icon.
+# Creates Desktop + Start Menu shortcuts for bin\hex.exe, and a dot-scope icon.
 #
 #   .\scripts\install-shortcut.ps1            # Desktop + Start Menu
 #   .\scripts\install-shortcut.ps1 -Startup   # ...and launch at login
 param([switch]$Startup)
 
 $ErrorActionPreference = 'Stop'
-$exe = (Resolve-Path "$PSScriptRoot\..\hex.exe").Path
+$exe = Join-Path (Split-Path -Parent $PSScriptRoot) "bin\hex.exe"
+if (-not (Test-Path $exe)) { throw "no $exe - run .\build.ps1 -Release first" }
+$exe = (Resolve-Path $exe).Path
 $dir = Split-Path $exe
 # Shortcuts point at hex.ico, which scripts/make-icon.py builds from Hex.png and
 # build.ps1 links into the exe. Only regenerate it here if it went missing.
