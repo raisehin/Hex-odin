@@ -195,9 +195,15 @@ transcribe_run :: proc(model_id: string, samples: []f32, language := "") -> (tex
 	// when the preload already warmed the session, and the whole cost after an
 	// idle release, so the log answers "why was that one slow" directly.
 	if res != nil {
+		wait_ms := time.duration_milliseconds(time.tick_since(t_model))
+		infer_ms := time.duration_milliseconds(time.tick_since(t_asr))
 		log_write("[hex] asr: model-wait %.0f ms, inference %.0f ms (%d samples)",
-			time.duration_milliseconds(time.tick_since(t_model)),
-			time.duration_milliseconds(time.tick_since(t_asr)), len(samples))
+			wait_ms, infer_ms, len(samples))
+		// Same numbers on stderr for the benchmark harness (autoresearch.sh),
+		// which cannot read the log file reliably. Off unless asked for.
+		if len(os.get_env("HEX_PROFILE", context.temp_allocator)) > 0 {
+			fmt.eprintf("PROFILE model_ms=%.0f infer_ms=%.0f samples=%d\n", wait_ms, infer_ms, len(samples))
+		}
 	}
 	if res == nil { return "", strings.clone("transcribe returned no text") }
 	defer shim.free_text(res)
