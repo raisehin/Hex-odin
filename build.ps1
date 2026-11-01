@@ -6,7 +6,11 @@ param([switch]$Release, [switch]$Native)
 
 $ErrorActionPreference = 'Stop'
 $odin  = "C:\Users\rhais\Documents\odin-windows-amd64-dev-2026-10\dist\odin.exe"
-$flags = @(if ($Release) { "-o:speed" } else { "-debug" })
+# -microarch:native: the built-in phonon engine's hot kernels are annotated with
+# their own target features, but the loops around them (mel, norms, softmax)
+# only vectorise when the build targets the host. Odin's default is x86-64/SSE2;
+# the encoder is 444 ms at that target against 326 ms at znver2.
+$flags = @(if ($Release) { "-o:speed" } else { "-debug" }) + "-microarch:native"
 
 # App icon: Hex.png -> hex.ico + hex.rc (scripts/make-icon.py) -> hex.res (rc.exe)
 # -> linked into the exe. The .res is what makes Explorer, the taskbar button and

@@ -98,6 +98,7 @@ MODEL_IDLE_SECONDS :: 180
 
 model_lock: sync.Mutex
 model_live: bool
+live_backend: Asr_Backend
 model_last: time.Time
 
 model_idle_seconds :: proc() -> f64 {
@@ -115,8 +116,7 @@ model_idle_worker :: proc(_: ^thread.Thread) {
 		log_flush()
 		sync.lock(&model_lock)
 		if model_live && time.duration_seconds(time.since(model_last)) >= limit {
-			if shim.close != nil { shim.close() }
-			model_live = false
+			model_close_locked()
 			sync.unlock(&model_lock)
 			log_write("[hex] model released after %d s idle", i32(limit))
 			continue
@@ -137,27 +137,53 @@ worker_threads :: proc(want: int) -> int {
 	return n - n / 4
 }
 
+
 // Init is 890 ms cold (measured) and the idle worker hands the session back
 // after MODEL_IDLE_SECONDS, so the wait used to land between the key release
 // and the paste. Preloading on the key down overlaps it with the recording.
 preload_running: i32
 
-model_ensure_locked :: proc(cfg: ^Config, model_id: string) -> (ok: bool, err: string) {
-	if model_live { return true, "" }
+model_close_locked :: proc() {
+	if !model_live { return }
+	if live_backend == .Phonon {
+		phonon_close()
+	} else if shim.close != nil {
+		shim.close()
+	}
+	model_live = false
+}
+
+model_ensure_locked :: proc(cfg: ^Config, model_id: string, backend: Asr_Backend) -> (ok: bool, err: string) {
+	if model_live && live_backend == backend { return true, "" }
+	// Switching model family (shim <-> built-in engine) drops the old session
+	// first: both hold the whole mapping, and only one is ever used at a time.
+	model_close_locked()
 	path := model_path(cfg, model_id)
 	if path == "" { return false, fmt.aprintf("unknown model: %s", model_id) }
 	if !file_exists(path) { return false, fmt.aprintf("model not installed: %s", path) }
-	if shim.set_threads != nil { shim.set_threads(i32(worker_threads(cfg.threads))) }
-	init := shim.init(strings.clone_to_cstring(path, context.temp_allocator))
-	if init != 0 {
-		if detail := shim_error_text(); len(detail) > 0 {
-			return false, fmt.aprintf("model init failed (%d): %s", init, detail)
+	switch backend {
+	case .Phonon:
+		// The built-in engine needs no thread hint: its pool has none of ggml's
+		// per-node barriers, so `threads = 0` there means the full logical count
+		// and SMT siblings are worth using (interleaved 6 vs 8 on the 1 s clip:
+		// 339 vs 334 ms median, and 6 spun up 589-599 ms outliers).
+		if ok, e := phonon_open(path, cfg.threads); !ok { return false, e }
+	case .Shim:
+		if shim.set_threads != nil { shim.set_threads(i32(worker_threads(cfg.threads))) }
+		init := shim.init(strings.clone_to_cstring(path, context.temp_allocator))
+		if init != 0 {
+			if detail := shim_error_text(); len(detail) > 0 {
+				return false, fmt.aprintf("model init failed (%d): %s", init, detail)
+			}
+			return false, fmt.aprintf("model init failed (%d)", init)
 		}
-		return false, fmt.aprintf("model init failed (%d)", init)
 	}
 	model_live = true
+	live_backend = backend
 	model_last = time.now()
-	if m := model_by_id(model_id); m != nil { log_write("[hex] model %s (%s)", model_id, m.filename) }
+	if m := model_by_id(model_id); m != nil {
+		log_write("[hex] model %s (%s) on %s", model_id, m.filename, engine_name(backend))
+	}
 	return true, ""
 }
 
@@ -166,7 +192,7 @@ preload_worker :: proc(_: ^thread.Thread) {
 	// The VAD model is 7.5 ms and belongs to the first dictation only.
 	_ = vad_load()
 	sync.lock(&model_lock)
-	_, _ = model_ensure_locked(&cfg, cfg.model)
+	_, _ = model_ensure_locked(&cfg, cfg.model, asr_backend_for(cfg.model))
 	sync.unlock(&model_lock)
 	sync.atomic_store(&preload_running, i32(0))
 }
@@ -175,7 +201,8 @@ preload_worker :: proc(_: ^thread.Thread) {
 // Never blocks the caller and never races the transcription: the worker takes
 // the same model lock, so a fast key release just waits for the preload.
 preload_model_async :: proc() {
-	if !transcribe_available() { return }
+	cfg := config_load()
+	if asr_backend_for(cfg.model) == .Shim && !transcribe_available() { return }
 	if sync.atomic_load(&preload_running) != 0 { return }
 	sync.atomic_store(&preload_running, i32(1))
 	if t := thread.create(preload_worker); t != nil {
@@ -237,29 +264,43 @@ trim_trailing_silence :: proc(samples: []f32) -> (out: []f32, trimmed_ms: int) {
 }
 
 transcribe_run :: proc(model_id: string, samples: []f32, language := "") -> (text: string, err: string) {
-	if !transcribe_available() {
+	cfg := config_load()
+	backend := asr_backend_for(model_id)
+	// The built-in engine needs no DLL; only the shim path does.
+	if backend == .Shim && !transcribe_available() {
 		return "", strings.clone("transcribe shim not built (scripts/build-native.ps1)")
 	}
-	cfg := config_load()
 
 	sync.lock(&model_lock)
 	defer sync.unlock(&model_lock)
 
 	t_model := time.tick_now()
-	if ok, e := model_ensure_locked(&cfg, model_id); !ok { return "", e }
+	if ok, e := model_ensure_locked(&cfg, model_id, backend); !ok { return "", e }
 	model_last = time.now()
 
 	samples, trimmed_ms := trim_trailing_silence(samples)
 	use_lang := language if len(language) > 0 else cfg.language
-	lang := strings.clone_to_cstring(use_lang, context.temp_allocator)
 	t_asr := time.tick_now()
 	set_transcribe_priority(true)
-	res := shim.transcribe(raw_data(samples), i32(len(samples)), lang)
+	res_text: string
+	res_err: string
+	if backend == .Phonon {
+		res_text, res_err = phonon_transcribe(samples)
+	} else {
+		lang := strings.clone_to_cstring(use_lang, context.temp_allocator)
+		res := shim.transcribe(raw_data(samples), i32(len(samples)), lang)
+		if res == nil {
+			res_err = strings.clone("transcribe returned no text")
+		} else {
+			res_text = strings.clone(string(res))
+			shim.free_text(res)
+		}
+	}
 	set_transcribe_priority(false)
 	// One line per dictation: the two stages a user waits on. Model wait is 0
 	// when the preload already warmed the session, and the whole cost after an
 	// idle release, so the log answers "why was that one slow" directly.
-	if res != nil {
+	if res_err == "" {
 		wait_ms := time.duration_milliseconds(time.tick_since(t_model))
 		infer_ms := time.duration_milliseconds(time.tick_since(t_asr))
 		log_write("[hex] asr: model-wait %.0f ms, inference %.0f ms (%d samples, %d ms tail trimmed)",
@@ -270,9 +311,7 @@ transcribe_run :: proc(model_id: string, samples: []f32, language := "") -> (tex
 			fmt.eprintf("PROFILE model_ms=%.0f infer_ms=%.0f samples=%d\n", wait_ms, infer_ms, len(samples))
 		}
 	}
-	if res == nil { return "", strings.clone("transcribe returned no text") }
-	defer shim.free_text(res)
-	return strings.clone(string(res)), ""
+	return res_text, res_err
 }
 
 

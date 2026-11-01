@@ -110,6 +110,21 @@ Python/torch appear only in that one-time conversion; loading, dictation and the
 GUI stay Odin + C++. Nothing on the runtime path touches Python — torch is not
 installed now, and dictation with `phonon25_en` works without it.
 
+Phonon-family models (`phonon25_en`) run on the built-in engine in
+`phonon/` — the Odin port of the parakeet encoder and TDT decoder, no DLL on the
+ASR path. It is the default and it passes the parity gate: for both benchmark
+clips (`Hello there.`, and the 1 s `Second,` dictation clip) the transcript is
+byte-identical to transcribe.cpp, and the encoder stages match the reference
+dumps at 1, 2, 4, 6 and 8 threads. It is not faster yet — 415 ms infer against
+the shim's 326 ms on the 1 s clip — but the model opens 606 ms instead of 890
+because the encoder weights stay in their shipped Q8_0/F16 form instead of being
+decoded to f32. `hex engine shim` (or `HEX_ASR=shim`, which the benchmark
+harness uses to keep its reference number) forces the transcribe.cpp path back
+on; `hex engine phonon` forces the built-in engine for any model. The env var
+wins over the config file, and `hex status` prints the resolved engine.
+Everything else — the VAD, and every other model family — still goes through the
+shim.
+
 Default: **Phonon-2.5 English Q8_0** (`phonon25_en`, 705 MB, English). Switch
 with `hex models use <id>`; a config pointing at a missing model falls back to
 the default instead of failing at startup. Phonon-2 was removed — same 0.6B
@@ -122,7 +137,9 @@ size class, 2.5 is the newer English model and no longer drops spaces
 src/main.odin        CLI dispatch
 src/capture.odin     miniaudio capture, 2-minute lock-free ring, level meter
 src/wav.odin         RIFF writer, 16-bit reader with mono downmix + resample
-src/transcribe.odin  dynlib shim loader + registry→path resolution
+src/transcribe.odin  dynlib shim loader + registry→path resolution, engine dispatch
+src/phonon_engine.odin  built-in ASR engine (phonon/ package) lifecycle
+phonon/              Odin port: GGUF reader, mel frontend, parakeet encoder, TDT decoder, Q8_0 kernels
 src/models.odin      port of transcription_models.rs (id, repo, rev, sha256, langs)
 src/config.odin      %APPDATA%\hex\odin-config
 src/paste.odin       SendInput Unicode

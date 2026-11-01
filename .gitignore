@@ -64,9 +64,9 @@ cmake_install.cmake
 .cache/
 
 # Unshipped port and reference trees -----------------------------------------
-# phonon/ is the unfinished Odin rewrite of the parakeet engine; src/ does not
-# import it, so the exe does not depend on it.
-/phonon/
+# phonon/ *is* shipped: src/phonon_engine.odin imports it and it is the default
+# ASR path for phonon models, so it is tracked like src/. Only the Rust port and
+# the reference trees are scaffolding.
 /phonon-rs-master/
 /reference/
 /vendor_src/
