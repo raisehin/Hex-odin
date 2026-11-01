@@ -202,7 +202,9 @@ transcribe_run :: proc(model_id: string, samples: []f32, language := "") -> (tex
 	use_lang := language if len(language) > 0 else cfg.language
 	lang := strings.clone_to_cstring(use_lang, context.temp_allocator)
 	t_asr := time.tick_now()
+	set_transcribe_priority(true)
 	res := shim.transcribe(raw_data(samples), i32(len(samples)), lang)
+	set_transcribe_priority(false)
 	// One line per dictation: the two stages a user waits on. Model wait is 0
 	// when the preload already warmed the session, and the whole cost after an
 	// idle release, so the log answers "why was that one slow" directly.
