@@ -22,6 +22,8 @@ foreign _ {
 	qk_pmaddubsw :: proc(a: simd.i8x32, b: simd.i8x32) -> simd.i16x16 ---
 	@(link_name = "llvm.x86.avx2.pmadd.wd")
 	qk_pmaddwd :: proc(a, b: simd.i16x16) -> simd.i32x8 ---
+	@(link_name = "llvm.x86.avx2.psign.b")
+	qk_psignb :: proc(a, b: simd.i8x32) -> simd.i8x32 ---
 }
 
 @(private, require_results)
@@ -36,12 +38,13 @@ qk_load_i8x32 :: #force_inline proc "contextless" (p: rawptr) -> simd.i8x32 {
 	return transmute(simd.i8x32)v
 }
 
-// w * sign(x): -w where x < 0, w elsewhere. Select over a negation is what
-// LLVM turns into vpsignb, one uop instead of the (w ^ (x>>7)) - (x>>7)
-// sequence it used to emit.
+// w * sign(x): -w where x < 0, w elsewhere. Spelled as an intrinsic because the
+// select over a negation does *not* fold to vpsignb: the AVX2 loop was emitting
+// vpcmpgtb + vpxor + vpsubb, three uops on the critical path of every 32-value
+// block, where vpsignb is one.
 @(private, require_results, enable_target_feature = "avx2")
 qk_signmul :: #force_inline proc "contextless" (w, x: simd.i8x32) -> simd.i8x32 {
-	return simd.select(simd.lanes_lt(x, simd.i8x32(0)), simd.sub(simd.i8x32(0), w), w)
+	return qk_psignb(w, x)
 }
 
 // Act is one quantised activation row: 32 int8 per block plus the block scale.

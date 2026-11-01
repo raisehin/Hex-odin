@@ -466,39 +466,80 @@ attention :: proc(e: ^Encoder, layer: int, x: Mat, out: Mat) {
 
 	bu := bw.pos_bias_u
 	bv := bw.pos_bias_v
-	scale := f32(1) / math.sqrt(f32(hd))
-	scores := e.ws.scores
-
-	// content and position scores for every head
-	for h in 0 ..< H {
-		off := h * hd
-		sc := scores[h * T * T:][:T * T]
-		for i in 0 ..< T {
-			qi := mat_row(q, i)[off:][:hd]
-			row := sc[i * T:][:T]
-			for j in 0 ..< T {
-				kj := mat_row(k, j)[off:][:hd]
-				ac: f32 = 0
-				for dd in 0 ..< hd { ac += (qi[dd] + bu[off + dd]) * kj[dd] }
-				// position term for index (j + T - 1 - i)
-				pj := mat_row(p, j + T - 1 - i)[off:][:hd]
-				bd: f32 = 0
-				for dd in 0 ..< hd { bd += (qi[dd] + bv[off + dd]) * pj[dd] }
-				row[j] = scale * (ac + bd)
-			}
-			softmax(row)
-		}
+	st := Score_Task {
+		q = q, k = k, p = p, scores = e.ws.scores,
+		bu = bu, bv = bv,
+		H = H, T = T, hd = hd,
+		scale = f32(1) / math.sqrt(f32(hd)),
 	}
-	// out[i][off + dd] = sum_j scores[i][j] * v[j][off + dd]
-	for i in 0 ..< T {
-		o := mat_row(out, i)
+	par_chunks(e.pool, e.workers, H * T, score_rows, &st)
+	at := AV_Task {scores = e.ws.scores, v = v, out = out, H = H, T = T, hd = hd}
+	par_chunks(e.pool, e.workers, T, av_rows, &at)
+}
+
+// The attention score and value-mixing phases are O(T^2) with an unvectorised
+// f32 reduction in the inner loop (Odin does not enable fast-math, so LLVM
+// cannot reassociate the sum), which made them the dominant cost on anything
+// longer than a second: 1.0 s of a 3.7 s encoder at T=103, against 0.4 s for
+// the three projection matmuls. Both phases are row-separable — a (head, query)
+// row owns its scores and its softmax, and a query row owns its output — so the
+// pool gets them without changing a single arithmetic order.
+
+@(private = "file")
+Score_Task :: struct {
+	q, k, p:  Mat,
+	scores:   []f32,
+	bu, bv:   []f32,
+	H, T, hd:        int,
+	scale:           f32,
+}
+
+@(private = "file")
+score_rows :: proc(ctx: rawptr, lo, hi: int) {
+	t := cast(^Score_Task)ctx
+	H, T, hd := t.H, t.T, t.hd
+	tt := T * T
+	for r in lo ..< hi {
+		h := r / T
+		i := r % T
+		off := h * hd
+		qi := mat_row(t.q, i)[off:][:hd]
+		row := t.scores[h * tt + i * T:][:T]
+		for j in 0 ..< T {
+			kj := mat_row(t.k, j)[off:][:hd]
+			ac: f32 = 0
+			for dd in 0 ..< hd { ac += (qi[dd] + t.bu[off + dd]) * kj[dd] }
+			// position term for index (j + T - 1 - i)
+			pj := mat_row(t.p, j + T - 1 - i)[off:][:hd]
+			bd: f32 = 0
+			for dd in 0 ..< hd { bd += (qi[dd] + t.bv[off + dd]) * pj[dd] }
+			row[j] = t.scale * (ac + bd)
+		}
+		softmax(row)
+	}
+}
+
+@(private = "file")
+AV_Task :: struct {
+	scores: []f32,
+	v, out: Mat,
+	H, T, hd: int,
+}
+
+@(private = "file")
+av_rows :: proc(ctx: rawptr, lo, hi: int) {
+	t := cast(^AV_Task)ctx
+	H, T, hd := t.H, t.T, t.hd
+	tt := T * T
+	for i in lo ..< hi {
+		o := mat_row(t.out, i)
 		for h in 0 ..< H {
 			off := h * hd
-			sc := scores[h * T * T + i * T:][:T]
+			sc := t.scores[h * tt + i * T:][:T]
 			for dd in 0 ..< hd { o[off + dd] = 0 }
 			for j in 0 ..< T {
 				w := sc[j]
-				vj := mat_row(v, j)[off:][:hd]
+				vj := mat_row(t.v, j)[off:][:hd]
 				for dd in 0 ..< hd { o[off + dd] += w * vj[dd] }
 			}
 		}
