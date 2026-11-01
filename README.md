@@ -4,11 +4,6 @@ A from-scratch Odin implementation of [Hex](https://anoma.ly/hex)'s dictation
 core and overlay, replacing the Rust application while keeping the C++ inference
 stack (`transcribe.cpp` / `ggml` / Vulkan) linked from Odin.
 
-Target: **no Rust in the build.** `C:\Users\rhais\Documents\hex` is the reference
-implementation, read-only here.
-
-## Status
-
 | Piece | State |
 |---|---|
 | CLI (`devices`, `record`, `transcribe`, `models`, `status`, `app`) | working |
