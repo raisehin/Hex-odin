@@ -44,6 +44,7 @@
 
 # Scratch and notes
 /.swarm/
+/autoresearch.sh
 /esctest.ps1
 /send.ps1
 
