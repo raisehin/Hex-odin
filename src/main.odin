@@ -47,6 +47,9 @@ main :: proc() {
 	case "vad":
 		if len(args) < 3 { fmt.eprintln("usage: hex vad <file.wav>"); os.exit(2) }
 		cmd_vad(args[2])
+	case "gguf":
+		if len(args) < 3 { fmt.eprintln("usage: hex gguf <model.gguf> [--list]"); os.exit(2) }
+		if !gguf_report(args[2], len(args) > 3 && args[3] == "--list") { os.exit(1) }
 	case "status":
 		cmd_status()
 	case "version", "--version", "-v":
@@ -139,6 +142,7 @@ in-flight transcription so nothing is pasted.
   hex record [file.wav]   capture the default mic until Enter
   hex transcribe <wav>    transcribe a wav (16-bit PCM any rate)
   hex vad <wav>           report silence/speech using the Silero VAD
+  hex gguf <model.gguf>   inspect a GGUF model (--list for every tensor)
   hex threads [n]         cap inference CPU workers (0 = all cores)
   hex paste [mode]        ctrl_v | ctrl_shift_v | shift_insert | type
   hex devices             list capture endpoints and compute backends
