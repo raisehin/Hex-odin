@@ -141,7 +141,13 @@ quantize_acts :: proc(a: Act, x: Mat) {
 // chain behind throughput.
 @(private, require_results, enable_target_feature = "avx2")
 qk_pf :: #force_inline proc "contextless" (woff, qoff: uintptr) -> simd.f32x8 {
-	wv := qk_load_i8x32(rawptr(woff + 2))
+	return qk_pf_w(qk_load_i8x32(rawptr(woff + 2)), qoff)
+}
+
+// qk_pf_w is qk_pf for an already-loaded weight block, so a caller that dots
+// one block against several activation rows loads those 32 bytes once.
+@(private, require_results, enable_target_feature = "avx2")
+qk_pf_w :: #force_inline proc "contextless" (wv: simd.i8x32, qoff: uintptr) -> simd.f32x8 {
 	xv := qk_load_i8x32(rawptr(qoff))
 	p16 := qk_pmaddubsw(simd.abs(xv), qk_signmul(wv, xv))
 	return simd.f32x8(qk_pmaddwd(p16, simd.i16x16(1)))
@@ -186,6 +192,68 @@ q8_0_dot_q8 :: proc "contextless" (w: []u8, ws: []f32, q: []i8, d: []f32) -> f32
 		acc = simd.fma(qk_pf(wp + uintptr(b * Q8_0_BLOCK_SIZEOF), qp + uintptr(b * Q8_0_QUANT_SIZEOF)), simd.f32x8(dh), acc)
 	}
 	return simd.reduce_add_ordered(acc)
+}
+
+// q8_0_dot_q8_2f computes w . act for one Q8_0 weight row against two
+// quantised frames at once. The row's 34-byte blocks are the traffic that
+// matters: lin_task visits every output row once per frame, so the encoder
+// re-reads its ~600 MB of Q8_0 weights 11 times per utterance and the matmul
+// path saturates DRAM (11.7 GFLOP at 63 GFLOPS = 35 GB/s of row bytes). One
+// pass over the blocks serves both dots, halving that.
+//
+// Per frame the accumulation is byte-identical to q8_0_dot_q8: the same four
+// interleaved accumulators over the same block quad, reduced in the same tree,
+// so this cannot move the encoder output.
+@(enable_target_feature = "avx2,fma")
+q8_0_dot_q8_2f :: proc "contextless" (w: []u8, ws: []f32, qa: []i8, da: []f32, qb: []i8, db: []f32) -> (fa, fb: f32) {
+	blocks := len(qa) / Q8_0_QUANT_SIZEOF
+	wp := uintptr(raw_data(w))
+	wsp := uintptr(raw_data(ws))
+	qap := uintptr(raw_data(qa))
+	qbp := uintptr(raw_data(qb))
+	dap := uintptr(raw_data(da))
+	dbp := uintptr(raw_data(db))
+	a0 := simd.f32x8(0)
+	a1 := simd.f32x8(0)
+	a2 := simd.f32x8(0)
+	a3 := simd.f32x8(0)
+	b0 := simd.f32x8(0)
+	b1 := simd.f32x8(0)
+	b2 := simd.f32x8(0)
+	b3 := simd.f32x8(0)
+	b := 0
+	for ; b + 4 <= blocks; b += 4 {
+		w0 := wp + uintptr(b * Q8_0_BLOCK_SIZEOF)
+		q0 := uintptr(b * Q8_0_QUANT_SIZEOF)
+		d0 := uintptr(b * 4)
+		sw := qk_load4(rawptr(wsp + d0))
+		sa := transmute([4]f32)(sw * qk_load4(rawptr(dap + d0)))
+		sb := transmute([4]f32)(sw * qk_load4(rawptr(dbp + d0)))
+		wv := qk_load_i8x32(rawptr(w0 + 2))
+		a0 = simd.fma(qk_pf_w(wv, qap + q0), simd.f32x8(sa[0]), a0)
+		b0 = simd.fma(qk_pf_w(wv, qbp + q0), simd.f32x8(sb[0]), b0)
+		wv = qk_load_i8x32(rawptr(w0 + 34 + 2))
+		a1 = simd.fma(qk_pf_w(wv, qap + q0 + 32), simd.f32x8(sa[1]), a1)
+		b1 = simd.fma(qk_pf_w(wv, qbp + q0 + 32), simd.f32x8(sb[1]), b1)
+		wv = qk_load_i8x32(rawptr(w0 + 68 + 2))
+		a2 = simd.fma(qk_pf_w(wv, qap + q0 + 64), simd.f32x8(sa[2]), a2)
+		b2 = simd.fma(qk_pf_w(wv, qbp + q0 + 64), simd.f32x8(sb[2]), b2)
+		wv = qk_load_i8x32(rawptr(w0 + 102 + 2))
+		a3 = simd.fma(qk_pf_w(wv, qap + q0 + 96), simd.f32x8(sa[3]), a3)
+		b3 = simd.fma(qk_pf_w(wv, qbp + q0 + 96), simd.f32x8(sb[3]), b3)
+	}
+	for ; b < blocks; b += 1 {
+		woff := wp + uintptr(b * Q8_0_BLOCK_SIZEOF)
+		qoff := uintptr(b * Q8_0_QUANT_SIZEOF)
+		doff := uintptr(b * 4)
+		sw := (cast(^f32)(wsp + doff))^
+		wv := qk_load_i8x32(rawptr(woff + 2))
+		a0 = simd.fma(qk_pf_w(wv, qap + qoff), simd.f32x8(sw * (cast(^f32)(dap + doff))^), a0)
+		b0 = simd.fma(qk_pf_w(wv, qbp + qoff), simd.f32x8(sw * (cast(^f32)(dbp + doff))^), b0)
+	}
+	fa = simd.reduce_add_ordered((a0 + a1) + (a2 + a3))
+	fb = simd.reduce_add_ordered((b0 + b1) + (b2 + b3))
+	return
 }
 
 // f32_dot_avx computes w . x for one F32 weight row.

@@ -271,15 +271,30 @@ lin_task :: proc(ctx: rawptr, wid: int) {
 	hi := min(lo + per, rows)
 	row_bytes := len(t.w.bytes) / rows
 	blocks := act_blocks(t.x.cols)
+	pairs := t.w.type == .Q8_0 // the 2-frame kernel only exists for Q8_0
+	frames := t.x.rows
 	for o in lo ..< hi {
 		row := t.w.bytes[o * row_bytes:][:row_bytes]
 		b := t.bias == nil ? 0 : t.bias[o]
-		for f in 0 ..< t.x.rows {
+		ws := scales_row(t.w, o)
+		f := 0
+		if pairs {
+			for ; f + 2 <= frames; f += 2 {
+				qa := t.a.q[f * t.x.cols:][:t.x.cols]
+				qb := t.a.q[(f + 1) * t.x.cols:][:t.x.cols]
+				da := t.a.d[f * blocks:][:blocks]
+				db := t.a.d[(f + 1) * blocks:][:blocks]
+				va, vb := q8_0_dot_q8_2f(row, ws, qa, da, qb, db)
+				t.out.data[f * t.out.cols + o] = t.bias == nil ? va : va + b
+				t.out.data[(f + 1) * t.out.cols + o] = t.bias == nil ? vb : vb + b
+			}
+		}
+		for ; f < frames; f += 1 {
 			a := Act {
 				q = t.a.q[f * t.x.cols:][:t.x.cols],
 				d = t.a.d[f * blocks:][:blocks],
 			}
-			v := weight_dot(row, scales_row(t.w, o), t.x.data[f * t.x.cols:][:t.x.cols], t.w.type, a)
+			v := weight_dot(row, ws, t.x.data[f * t.x.cols:][:t.x.cols], t.w.type, a)
 			t.out.data[f * t.out.cols + o] = t.bias == nil ? v : v + b
 		}
 	}
