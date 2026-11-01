@@ -1,64 +1,143 @@
-# Build output
+# =============================================================================
+# What this repo ships: the sources needed to build hex.exe.
+#   src/                     Odin app (13 files)
+#   native/CMakeLists.txt    + transcribe_shim.{cpp,h}
+#   build.ps1                + scripts/make-icon.py (regenerates hex.res)
+#   Hex.png                  icon source
+#   README.md
+# Everything else is local scaffolding: ports, benchmarks, probes, captures,
+# generated artifacts. No upstream PRs for now, so none of it is worth pushing.
+# =============================================================================
+
+# Build output ---------------------------------------------------------------
 /hex.exe
 /hex.pdb
+/hex.res
+/hex.rc
+/hex.ico
 *.exe
+*.pdb
 *.o
 *.obj
 *.lib
+*.a
 *.dll
 *.so
 *.dylib
 *.exp
 *.ilk
 *.ll
+*.map
+*.res
+*.bin
 
-# Generated resources (scripts/make-icon.py + rc.exe, from Hex.png)
-/hex.ico
-/hex.rc
-/hex.res
-
-# Native shim and cmake trees (built by scripts/build-native.ps1)
+# Native shim and cmake trees (built by scripts/build-native.ps1) ------------
 /native/build/
 /native/build-*/
 /native/bin/
 /native/third_party/
-/native/build-transcribe.log
+/native/transcribe_shim.dll
+/transcribe_shim.dll
 
-# Third-party source drops kept for reading only
+# CMake litter ---------------------------------------------------------------
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.ninja
+.ninja_deps
+.ninja_log
+*.vcxproj
+*.vcxproj.*
+*.sln
+/_deps/
+/out/
+/install/
+/build/
+/.vs/
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+.cache/
+
+# Unshipped port and reference trees -----------------------------------------
+# phonon/ is the unfinished Odin rewrite of the parakeet engine; src/ does not
+# import it, so the exe does not depend on it.
+/phonon/
 /phonon-rs-master/
+/reference/
+/vendor_src/
 
-# Models and archives (real home is %APPDATA%\hex\models)
+# Local research scaffolding -------------------------------------------------
+/.swarm/
+/autoresearch.sh
+/autoresearch*
+/esctest.ps1
+/send.ps1
+/bench*/
+/probe*/
+/experiments/
+/scratch/
+/tmp/
+/dumps/
+/dump/
+/parity/
+/notes/
+/NOTES*
+/TODO*
+/HANDOFF*
+*.bak
+*.orig
+*.rej
+*.patch
+*.diff
+*.tmp
+*.log
+
+# Test and benchmark audio, images, captures ---------------------------------
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.m4a
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+!/Hex.png
+
+# Models and archives (real home is %APPDATA%\hex\models) --------------------
 *.gguf
 *.bps.tar.zst
 *.zst
-*.bin
+*.tar
+*.zip
+*.7z
+/models/
+# model conversions land in native/models (scripts/convert-phonon25.py, fetch-phonon25.ps1)
+/native/models/
+/cache/
 
-# Test audio and captures
-*.mp3
-*.wav
-*.png
-!/Hex.png
-
-# Local logs
-*.log
-
-# Scratch and notes
-/.swarm/
-/autoresearch.sh
-/esctest.ps1
-/send.ps1
-
-# Python tooling leftovers
+# Python tooling leftovers ---------------------------------------------------
 __pycache__/
 *.py[cod]
 .venv/
+venv/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
 
-# Editor / OS
+# Editor / OS ----------------------------------------------------------------
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
 Thumbs.db
 desktop.ini
 .DS_Store
