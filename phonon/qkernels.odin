@@ -1,6 +1,6 @@
 package phonon
 
-// AVX2/FMA/F16C kernels for the weight formats the model actually ships.
+// AVX2/FMA kernels for the weight formats the model actually ships.
 // Every kernel is a straight-line vector loop over one weight row: the
 // encoder streams ~600 M weights per utterance on 4 Zen2 cores, so the
 // scalar version in linalg.odin is ~15x off the reference (ggml) and these
@@ -285,4 +285,207 @@ f32_dot_avx :: proc "contextless" (w: []u8, x: []f32) -> f32 {
 		sum += (cast(^f32)(wp + uintptr(i * 4)))^ * x[i]
 	}
 	return sum
+}
+
+// --- pre-encode subsampling convolutions ------------------------------------
+//
+// The three conv shapes in front of the encoder are small matmuls, but they
+// were the slowest part of the stage: the generic path im2col'd into a
+// [pos][taps] matrix, ran the frame-oriented F32 dot (9-column rows never reach
+// the vector body, so 835k scalar dots for conv.0) and scattered the result back
+// to [oc][pos]. Each shape now has a kernel built around the layout the next
+// layer reads, so stores stay contiguous and the inner loops vectorise.
+
+// qk_store8 stores through a [8]f32 pointer: simd.f32x8 carries 32-byte
+// alignment, and the destination planes only guarantee 4.
+qk_store8 :: #force_inline proc "contextless" (p: rawptr, v: simd.f32x8) {
+	(cast(^[8]f32)p)^ = transmute([8]f32)v
+}
+
+Conv_First_Ctx :: struct {
+	x:    []f32, // [it][ifr], one channel
+	w:    []f32, // [oc][taps], tap order kx then ky
+	bias: []f32,
+	out:  []f32, // [oc][pos]
+	pos:  int,
+	it:   int,
+	ot:   int,
+	ofr:  int,
+	ifr:  int,
+	kx:   int,
+	ky:   int,
+	s:    int,
+	p:    int,
+	ocs:  int,
+}
+
+// conv_first_chunk handles one contiguous range of output positions. The taps of
+// a position tile are gathered once, tap-major, so the loop over output channels
+// is `taps` contiguous fma over eight positions and nothing is re-gathered.
+@(enable_target_feature = "avx2,fma")
+conv_first_chunk :: proc(data: rawptr, lo, hi: int) #no_bounds_check {
+	c := cast(^Conv_First_Ctx)data
+	TILE :: 128
+	// Stack scratch: the worker threads have no allocator of their own, and the
+	// taps of one tile are tiny (9 f32 for the model's 3x3 kernel).
+	xm: [TILE * 16]f32
+	taps := c.kx * c.ky
+	xmp := uintptr(raw_data(xm[:]))
+	outp := uintptr(raw_data(c.out))
+
+	for t0 := lo; t0 < hi; t0 += TILE {
+		n := min(TILE, hi - t0)
+		for t in 0 ..< taps {
+			ky_i := t / c.kx
+			kx_i := t % c.kx
+			for j in 0 ..< n {
+				p := t0 + j
+				iy := (p / c.ofr) * c.s - c.p + ky_i
+				ix := (p % c.ofr) * c.s - c.p + kx_i
+				ok := iy >= 0 && iy < c.it && ix >= 0 && ix < c.ifr
+				xm[t * TILE + j] = ok ? c.x[(iy * c.ifr) + ix] : 0
+			}
+		}
+		for oc in 0 ..< c.ocs {
+			wrow := c.w[oc * taps:][:taps]
+			b := c.bias == nil ? 0 : c.bias[oc]
+			dst := outp + uintptr((oc * c.pos + t0) * 4)
+			j := 0
+			for ; j + 8 <= n; j += 8 {
+				acc := simd.f32x8(0)
+				for t in 0 ..< taps {
+					acc = simd.fma(simd.f32x8(wrow[t]), qk_load8(rawptr(xmp + uintptr((t * TILE + j) * 4))), acc)
+				}
+				qk_store8(rawptr(dst + uintptr(j * 4)), acc + simd.f32x8(b))
+			}
+			for ; j < n; j += 1 {
+				s := b
+				for t in 0 ..< taps { s += wrow[t] * xm[t * TILE + j] }
+				c.out[oc * c.pos + t0 + j] = s
+			}
+		}
+	}
+}
+
+// conv_first_3x3s2 is the encoder's first subsampling layer (1 -> ocs outputs,
+// kx by ky taps, stride 2, bias). No relu inside: conv2d stays a pure
+// convolution for every dispatch path, the caller applies its own.
+conv_first_3x3s2 :: proc(
+	x: []f32,
+	it, ifr: int,
+	w: []f32,
+	kx, ky, ocs: int,
+	bias: []f32,
+	s, p: int,
+	pool: ^Pool,
+	workers: int,
+	out: []f32, // [ocs][ot * ofr]
+) {
+	assert(kx * ky <= 16, "conv_first_3x3s2: tap scratch is 16 deep")
+	ot := (it + 2 * p - ky) / s + 1
+	ofr := (ifr + 2 * p - kx) / s + 1
+	pos := ot * ofr
+	ctx := Conv_First_Ctx {
+		x    = x,
+		w    = w,
+		bias = bias,
+		out  = out,
+		pos  = pos,
+		it   = it,
+		ot   = ot,
+		ofr  = ofr,
+		ifr  = ifr,
+		kx   = kx,
+		ky   = ky,
+		s    = s,
+		p    = p,
+		ocs  = ocs,
+	}
+	par_chunks(pool, workers, pos, conv_first_chunk, &ctx)
+}
+
+Conv_1x1_Ctx :: struct {
+	x:    []f32, // [ics][pos]
+	w:    []f32, // [ocs][ics]: ggml (1,1,ics,ocs) keeps ics contiguous
+	bias: []f32,
+	out: []f32, // [ocs][pos]
+	pos: int,
+	ics: int,
+	ocs: int,
+}
+
+// conv_1x1_chunk runs eight positions at a time against four output channels at
+// once. Four accumulators is what makes it throughput- rather than latency-bound:
+// a single fma chain stalls on its own latency (4 cycles per eight products,
+// 0.5 MAC/cycle) because every provider of the loaded vector is serial.
+@(enable_target_feature = "avx2,fma")
+conv_1x1_chunk :: proc(data: rawptr, lo, hi: int) #no_bounds_check {
+	c := cast(^Conv_1x1_Ctx)data
+	xp := uintptr(raw_data(c.x))
+	outp := uintptr(raw_data(c.out))
+	ics := c.ics
+	pos4 := uintptr(c.pos * 4) // activation row stride, bytes
+	w4 := uintptr(ics * 4)    // weight row stride, bytes
+
+	for p0 := lo; p0 < hi; p0 += 8 {
+		n := min(8, hi - p0)
+		if n != 8 {
+			for o in 0 ..< c.ocs {
+				row := c.w[o * ics:][:ics]
+				for j in 0 ..< n {
+					s := c.bias[o]
+					for i in 0 ..< ics { s += row[i] * c.x[i * c.pos + p0 + j] }
+					c.out[o * c.pos + p0 + j] = s
+				}
+			}
+			continue
+		}
+		o := 0
+		for ; o + 4 <= c.ocs; o += 4 {
+			a0 := simd.f32x8(0)
+			a1 := simd.f32x8(0)
+			a2 := simd.f32x8(0)
+			a3 := simd.f32x8(0)
+			r0 := uintptr(raw_data(c.w[o * ics:][:ics]))
+			i := 0
+			for ; i < ics; i += 1 {
+				xv := qk_load8(rawptr(xp + uintptr(p0 * 4) + uintptr(i) * pos4))
+				o4 := uintptr(i * 4)
+				a0 = simd.fma(simd.f32x8((cast(^f32)(rawptr(r0 + o4)))^), xv, a0)
+				a1 = simd.fma(simd.f32x8((cast(^f32)(rawptr(r0 + w4 + o4)))^), xv, a1)
+				a2 = simd.fma(simd.f32x8((cast(^f32)(rawptr(r0 + 2 * w4 + o4)))^), xv, a2)
+				a3 = simd.fma(simd.f32x8((cast(^f32)(rawptr(r0 + 3 * w4 + o4)))^), xv, a3)
+			}
+			dst := outp + uintptr((o * c.pos + p0) * 4)
+			qk_store8(rawptr(dst), a0 + simd.f32x8(c.bias[o]))
+			qk_store8(rawptr(dst + uintptr(c.pos * 4)), a1 + simd.f32x8(c.bias[o + 1]))
+			qk_store8(rawptr(dst + uintptr(c.pos * 8)), a2 + simd.f32x8(c.bias[o + 2]))
+			qk_store8(rawptr(dst + uintptr(c.pos * 12)), a3 + simd.f32x8(c.bias[o + 3]))
+		}
+		for ; o < c.ocs; o += 1 {
+			row := c.w[o * ics:][:ics]
+			acc := simd.f32x8(0)
+			for i in 0 ..< ics {
+				acc = simd.fma(simd.f32x8(row[i]), qk_load8(rawptr(xp + uintptr(p0 * 4) + uintptr(i) * pos4)), acc)
+			}
+			qk_store8(rawptr(outp + uintptr((o * c.pos + p0) * 4)), acc + simd.f32x8(c.bias[o]))
+		}
+	}
+}
+
+// conv_1x1 is a [ics][pos] x [ics][ocs] matmul with a bias, written back
+// channel-major. Both the weight rows and the eight-position activation vectors
+// are contiguous in that layout, so nothing is transposed.
+conv_1x1 :: proc(
+	x: []f32,
+	ics, pos: int,
+	w: []f32, // [ocs][ics]
+	ocs: int,
+	bias: []f32,
+	pool: ^Pool,
+	workers: int,
+	out: []f32,
+) {
+	ctx := Conv_1x1_Ctx{x = x, w = w, bias = bias, out = out, pos = pos, ics = ics, ocs = ocs}
+	par_chunks(pool, workers, pos, conv_1x1_chunk, &ctx)
 }

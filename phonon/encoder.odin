@@ -73,34 +73,9 @@ conv2d :: proc(
 	out = make([]f32, ocs * pos)
 	switch {
 	case groups == 1 && kx == 1 && ky == 1 && s == 1 && p == 0:
-		conv1x1(x, ics, pos, w, ocs, bias, pool, workers, out)
+		conv_1x1(x, ics, pos, w, ocs, bias, pool, workers, out)
 	case groups == 1 && ics == 1:
-		// first layer: one input channel, so the 3x3 window is 9 taps and the
-		// weight matrix is [oc][9]; im2col then a matmul.
-		k := kx * ky
-		xm := make([]f32, pos * k, context.temp_allocator)
-		for ty in 0 ..< ot {
-			for fx in 0 ..< ofr {
-				row := xm[(ty * ofr + fx) * k:][:k]
-				t := 0
-				for ky_i in 0 ..< ky {
-					iy := ty * s - p + ky_i
-					for kx_i in 0 ..< kx {
-						ix := fx * s - p + kx_i
-						ok := iy >= 0 && iy < it && ix >= 0 && ix < ifr
-						row[t] = ok ? x[iy * ifr + ix] : 0
-						t += 1
-					}
-				}
-			}
-		}
-		om := Mat{rows = pos, cols = ocs, data = make([]f32, pos * ocs, context.temp_allocator)}
-		xmat := Mat{rows = pos, cols = k, data = xm}
-		lin_rows_par(om, xmat, f32_tensor(w[0:ocs * k]), bias, pool, workers)
-		for o in 0 ..< ocs {
-			plane := out[o * pos:][:pos]
-			for i in 0 ..< pos { plane[i] = om.data[i * ocs + o] }
-		}
+		conv_first_3x3s2(x, it, ifr, w, kx, ky, ocs, bias, s, p, pool, workers, out)
 	case groups == ics && groups == ocs:
 		// depthwise: one 3x3 kernel per channel, channel planes contiguous
 		in_per_group := ics / groups
@@ -130,21 +105,6 @@ conv2d :: proc(
 		panic("conv2d: unsupported shape")
 	}
 	return
-}
-
-// conv1x1 is a [pos][ics] x [ics][ocs] matmul, written back channel-major.
-conv1x1 :: proc(x: []f32, ics, pos: int, w: []f32, ocs: int, bias: []f32, pool: ^Pool, workers: int, out: []f32) {
-	xm := Mat{rows = pos, cols = ics, data = make([]f32, pos * ics, context.temp_allocator)}
-	for c in 0 ..< ics {
-		src := x[c * pos:][:pos]
-		for i in 0 ..< pos { xm.data[i * ics + c] = src[i] }
-	}
-	om := Mat{rows = pos, cols = ocs, data = make([]f32, pos * ocs, context.temp_allocator)}
-	lin_rows_par(om, xm, f32_tensor(w[:ocs * ics]), bias, pool, workers)
-	for o in 0 ..< ocs {
-		plane := out[o * pos:][:pos]
-		for i in 0 ..< pos { plane[i] = om.data[i * ocs + o] }
-	}
 }
 
 relu_in_place :: proc(x: []f32) {
@@ -296,6 +256,7 @@ Encode_Stats :: struct {
 	conv_dw:    f64,
 	conv_pw2:   f64,
 	resid:      f64, // the four residual adds
+	pre_conv:   [8]f64, // pre_encode: the mel scatter, conv.0/2/3/5/6, the stack, the out projection
 }
 
 @(private = "file")
@@ -404,6 +365,14 @@ encoder_destroy :: proc(e: ^Encoder) {
 	e^ = {}
 }
 
+// pre_mark closes one pre_encode stage into stats.pre_conv; with stats off it
+// costs nothing, not even the tick.
+pre_mark :: proc(e: ^Encoder, i: int, t0: ^time.Tick) {
+	if e.stats == nil { return }
+	e.stats.pre_conv[i] += ms_since(t0^)
+	t0^ = time.tick_now()
+}
+
 // pre_encode consumes the mel plane [n_mels][frames] and produces [T][d_model].
 pre_encode :: proc(e: ^Encoder, mel: []f32, n_mels, frames: int, alloc := context.allocator) -> Mat {
 	cfg := e.cfg
@@ -416,22 +385,30 @@ pre_encode :: proc(e: ^Encoder, mel: []f32, n_mels, frames: int, alloc := contex
 			x0[t * n_mels + f] = mel[f * frames + t]
 		}
 	}
+	_pt: time.Tick
+	if e.stats != nil { _pt = time.tick_now() }
 	it, ifr := frames, n_mels
+	pre_mark(e, 0, &_pt)
 	// conv.0: 3x3 stride 2 pad 1, 1 -> 256
 	x1, t1, f1 := sub_conv(e, x0, 1, it, ifr, "enc.pre_encode.conv.0", 1, 2, 1)
 	relu_in_place(x1)
 	// conv.2: depthwise 3x3 stride 2 pad 1
+	pre_mark(e, 1, &_pt)
 	x2, t2, f2 := sub_conv(e, x1, cfg.sub_channels, t1, f1, "enc.pre_encode.conv.2", cfg.sub_channels, 2, 1)
 	// conv.3: pointwise with bias + relu
+	pre_mark(e, 2, &_pt)
 	x3, t3, f3 := sub_conv(e, x2, cfg.sub_channels, t2, f2, "enc.pre_encode.conv.3", 1, 1, 0)
 	relu_in_place(x3)
 	// conv.5: depthwise, conv.6: pointwise
+	pre_mark(e, 3, &_pt)
 	x5, t5, f5 := sub_conv(e, x3, cfg.sub_channels, t3, f3, "enc.pre_encode.conv.5", cfg.sub_channels, 2, 1)
+	pre_mark(e, 4, &_pt)
 	x6, t6, f6 := sub_conv(e, x5, cfg.sub_channels, t5, f5, "enc.pre_encode.conv.6", 1, 1, 0)
 	relu_in_place(x6)
 	T := t6
 	C := cfg.sub_channels
 	// reshape [ch][t][f] -> [t][ch * f]: channel-major, frequency minor
+	pre_mark(e, 5, &_pt)
 	stacked := make([]f32, T * C * f6, context.temp_allocator)
 	for c in 0 ..< C {
 		for t in 0 ..< T {
@@ -440,10 +417,10 @@ pre_encode :: proc(e: ^Encoder, mel: []f32, n_mels, frames: int, alloc := contex
 			}
 		}
 	}
+	pre_mark(e, 6, &_pt)
 	out := mat_make(T, cfg.d_model, alloc)
-	for t in 0 ..< T {
-		lin(mat_row(out, t), stacked[t * C * f6:][:C * f6], wt(g, "enc.pre_encode.out.weight"), fb(g, "enc.pre_encode.out.bias"))
-	}
+	lin_rows_par(out, Mat{rows = T, cols = C * f6, data = stacked}, wt(g, "enc.pre_encode.out.weight"), fb(g, "enc.pre_encode.out.bias"), e.pool, e.workers)
+	pre_mark(e, 7, &_pt)
 	return out
 }
 

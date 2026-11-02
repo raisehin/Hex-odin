@@ -70,11 +70,13 @@ cmake_install.cmake
 
 # Local research scaffolding -------------------------------------------------
 /.swarm/
-/autoresearch.sh
 /autoresearch*
+!/autoresearch.sh
 /esctest.ps1
 /send.ps1
 /bench*/
+!/bench-kernels/
+!/bench-kernels/*.wav
 /probe*/
 /experiments/
 /scratch/
