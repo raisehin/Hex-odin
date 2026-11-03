@@ -19,12 +19,23 @@ package phonon
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:time"
 import d3d12 "./d3d12"
 
 Gpu_Enc :: struct {
 	dev:     ^d3d12.Gpu,
 	ok:      bool,
 	err:     string,
+	// Measurement only: what a split linear actually spends its time on.
+	// up is the activation upload, launch is the dispatch, span is the CPU
+	// half running concurrently with the GPU, join is the fence wait plus
+	// the readback of the GPU's rows. If join is a large fraction of the
+	// total, the cost is the per-linear round trip, not the arithmetic.
+	n_engaged: int,
+	up_ms:     f64,
+	launch_ms: f64,
+	span_ms:   f64,
+	join_ms:   f64,
 	weights: map[string]^d3d12.Weights,
 	scratch: map[[3]int]^d3d12.Scratch,
 }
@@ -62,6 +73,13 @@ gpu_enc_open :: proc() -> ^Gpu_Enc {
 gpu_enc_open_if_enabled :: proc() -> ^Gpu_Enc {
 	if !gpu_enc_wanted() { return nil }
 	return gpu_enc_open()
+}
+
+// gpu_split_stats reports how many linears took the split and what each phase
+// cost, so the benchmark can separate arithmetic from per-linear round trips.
+gpu_split_stats :: proc(ge: ^Gpu_Enc) -> (n: int, up, launch, span, join: f64) {
+	if ge == nil { return }
+	return ge.n_engaged, ge.up_ms, ge.launch_ms, ge.span_ms, ge.join_ms
 }
 
 gpu_enc_close :: proc(ge: ^Gpu_Enc) {
@@ -143,11 +161,14 @@ gpu_lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, ge: ^Gpu_Enc, poo
 	acts := act_make(t, k, context.temp_allocator)
 	defer act_destroy(&acts, context.temp_allocator)
 	quantize_acts_par(acts, x, pool, workers)
+	_t_up := time.tick_now()
 	if err := d3d12.scratch_write_acts(sc, mem.slice_data_cast([]u8, acts.q), mem.slice_data_cast([]u8, acts.d)); err != "" {
 		ge.err = err
 		ge.ok = false
 		return false
 	}
+	ge.up_ms += time.duration_milliseconds(time.tick_since(_t_up))
+	_t_launch := time.tick_now()
 	if err := d3d12.gemm_launch(ge.dev, ww, sc, mid); err != "" {
 		// Launch failed before the GPU did anything: whole linear on CPU.
 		ge.err = fmt.tprintf("gpu exec %s: %s", w.name, err)
@@ -155,8 +176,12 @@ gpu_lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, ge: ^Gpu_Enc, poo
 		lin_rows_par(out, x, w, bias, pool, workers)
 		return true
 	}
+	ge.launch_ms += time.duration_milliseconds(time.tick_since(_t_launch))
 	// The pool owns rows [mid, n) while the GPU owns [0, mid).
+	_t_span := time.tick_now()
 	lin_rows_par_span(out, x, w, bias, acts, pool, workers, mid, n)
+	ge.span_ms += time.duration_milliseconds(time.tick_since(_t_span))
+	_t_join := time.tick_now()
 	if err := d3d12.gemm_finish_strided(ge.dev, sc, out.data, n); err != "" {
 		// GPU failed after the CPU half finished: fill its rows on the CPU.
 		ge.err = fmt.tprintf("gpu exec %s: %s", w.name, err)
@@ -164,6 +189,8 @@ gpu_lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, ge: ^Gpu_Enc, poo
 		lin_rows_par_span(out, x, w, bias, acts, pool, workers, 0, mid)
 		return true
 	}
+	ge.join_ms += time.duration_milliseconds(time.tick_since(_t_join))
+	ge.n_engaged += 1
 	return true
 }
 

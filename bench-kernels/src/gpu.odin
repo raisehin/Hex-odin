@@ -262,4 +262,13 @@ cmd_gpuenc :: proc(args: []string) {
 		stats.attn_qkv, stats.attn_score, stats.ffn, stats.conv, stats.norm, stats.resid)
 	fmt.printf("GPUENC attn_split sc=%.1f av=%.1f out=%.1f\n",
 		stats.attn_sc, stats.attn_av, stats.attn_out)
+	split_n, split_up, split_launch, split_span, split_join := phonon.gpu_split_stats(eg.enc.gpu)
+	split_total := split_up + split_launch + split_span + split_join
+	fmt.printf("GPUENC split n=%d up=%.1f launch=%.1f span=%.1f join=%.1f sum=%.1f (enc %.1f)\n",
+		split_n, split_up, split_launch, split_span, split_join, split_total, gpu_enc_ms)
+	if split_n > 0 {
+		fmt.printf("GPUENC split_per_linear up=%.3f launch=%.3f span=%.3f join=%.3f ms\n",
+			split_up / f64(split_n), split_launch / f64(split_n),
+			split_span / f64(split_n), split_join / f64(split_n))
+	}
 }
