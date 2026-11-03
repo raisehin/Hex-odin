@@ -1,0 +1,169 @@
+// GPU sidecar for the encoder: persistent Q8_0 weights, per-shape scratch.
+//
+// The D3D12 layer owns buffers; this file owns policy. Weights are uploaded
+// once per tensor and read by every utterance until the engine closes, so the
+// 600 MB repack is a load-time cost, not a per-utterance one. Scratch buffers
+// are keyed by (n, k, t) and reused whenever an utterance has the same
+// geometry. Anything the GPU cannot do — a non-Q8_0 tensor, an oversized k,
+// an upload failure, a dispatch error — returns false and the caller runs the
+// CPU kernels instead; a dispatch error additionally poisons the sidecar so
+// the rest of the utterance stays on the CPU path.
+//
+// Selection is explicit: HEX_GPU=1 (or d3d12/gpu) enables the device at engine
+// open. Unset means Center CPU, no device, no extra memory.
+
+package phonon
+
+import "core:fmt"
+import "core:mem"
+import "core:os"
+import d3d12 "./d3d12"
+
+Gpu_Enc :: struct {
+	dev:     ^d3d12.Gpu,
+	ok:      bool,
+	err:     string,
+	weights: map[string]^d3d12.Weights,
+	scratch: map[[3]int]^d3d12.Scratch,
+}
+
+gpu_enc_wanted :: proc() -> bool {
+	v := os.get_env("HEX_GPU", context.temp_allocator)
+	return v == "1" || v == "d3d12" || v == "gpu"
+}
+
+gpu_enc_open :: proc() -> ^Gpu_Enc {
+	ge := new(Gpu_Enc)
+	ge.weights = make(map[string]^d3d12.Weights)
+	ge.scratch = make(map[[3]int]^d3d12.Scratch)
+	dev, err := d3d12.gpu_init(d3d12.Q8_0_GEMM_DXIL)
+	if err != "" {
+		ge.err = err
+		return ge
+	}
+	ge.dev = dev
+	ge.ok = true
+	return ge
+}
+
+gpu_enc_open_if_enabled :: proc() -> ^Gpu_Enc {
+	if !gpu_enc_wanted() { return nil }
+	return gpu_enc_open()
+}
+
+gpu_enc_close :: proc(ge: ^Gpu_Enc) {
+	if ge == nil { return }
+	for _, s in ge.scratch { d3d12.scratch_destroy(s) }
+	delete(ge.scratch)
+	for _, w in ge.weights { d3d12.weights_destroy(w) }
+	delete(ge.weights)
+	d3d12.gpu_destroy(ge.dev)
+	free(ge)
+}
+
+// SPLIT_MIN_MAC floors the row-split in multiply-accumulates (t*n*k): the
+// split halves compute but pays one launch, one fence and one readback, so
+// small linears stay on the CPU path. Measured on the 680M: below ~80M MACs
+// the overhead exceeds the concurrency gain (short commands run pure CPU
+// with zero regression); above it the split wins.
+SPLIT_MIN_MAC :: 80_000_000
+
+// gpu_lin_rows runs one encoder linear as a GPU+CPU row-split: the GPU takes
+// output rows [0, mid) while the pool takes [mid, n) concurrently, sharing a
+// single activation quantisation. True means out is filled; false means the
+// caller must run the CPU kernels. A GPU failure mid-flight fills the missing
+// rows on the CPU and poisons the sidecar, so the rest of the utterance stays
+// on the CPU path.
+gpu_lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, ge: ^Gpu_Enc, pool: ^Pool, workers: int) -> bool {
+	if ge == nil || !ge.ok { return false }
+	if w.type != .Q8_0 { return false }
+	n := int(w.dims[1])
+	k := int(w.dims[0])
+	t := x.rows
+	if n <= 0 || k <= 0 || t <= 0 { return false }
+	if k % 32 != 0 || k > d3d12.MAX_K { return false }
+	if out.rows != t || out.cols != n || x.cols != k { return false }
+	if len(out.data) != t * n { return false }
+	has_bias := bias != nil
+	if has_bias && len(bias) != n { return false }
+	if len(w.bytes) != n * (k / 32) * 34 { return false }
+
+	ww, found := ge.weights[w.name]
+	if !found {
+		nw, err := d3d12.weights_upload(ge.dev, n, k, w.bytes, has_bias)
+		if err != "" {
+			ge.err = fmt.tprintf("gpu weights %s: %s", w.name, err)
+			ge.ok = false
+			return false
+		}
+		if has_bias {
+			if berr := d3d12.weights_set_bias(nw, bias); berr != "" {
+				d3d12.weights_destroy(nw)
+				ge.err = berr
+				ge.ok = false
+				return false
+			}
+		}
+		ge.weights[w.name] = nw
+		ww = nw
+	}
+	if ww.n != n || ww.k != k || ww.has_bias != has_bias { return false }
+
+	// Even split point: lin_rows_core pairs rows, so every range must start
+	// on an even row to stay bit-identical with the serial path.
+	mid := (n / 2) / 2 * 2
+	if mid < 2 || t*n*k < SPLIT_MIN_MAC { return false }
+
+	key := [3]int{mid, k, t}
+	sc, sok := ge.scratch[key]
+	if !sok {
+		ns, err := d3d12.scratch_create(ge.dev, mid, k, t)
+		if err != "" {
+			ge.err = err
+			ge.ok = false
+			return false
+		}
+		ge.scratch[key] = ns
+		sc = ns
+	}
+
+	acts := act_make(t, k, context.temp_allocator)
+	defer act_destroy(&acts, context.temp_allocator)
+	quantize_acts(acts, x)
+	if err := d3d12.scratch_write_acts(sc, mem.slice_data_cast([]u8, acts.q), mem.slice_data_cast([]u8, acts.d)); err != "" {
+		ge.err = err
+		ge.ok = false
+		return false
+	}
+	if err := d3d12.gemm_launch(ge.dev, ww, sc, mid); err != "" {
+		// Launch failed before the GPU did anything: whole linear on CPU.
+		ge.err = fmt.tprintf("gpu exec %s: %s", w.name, err)
+		ge.ok = false
+		lin_rows_par(out, x, w, bias, pool, workers)
+		return true
+	}
+	// The pool owns rows [mid, n) while the GPU owns [0, mid).
+	lin_rows_par_span(out, x, w, bias, acts, pool, workers, mid, n)
+	if err := d3d12.gemm_finish_strided(ge.dev, sc, out.data, n); err != "" {
+		// GPU failed after the CPU half finished: fill its rows on the CPU.
+		ge.err = fmt.tprintf("gpu exec %s: %s", w.name, err)
+		ge.ok = false
+		lin_rows_par_span(out, x, w, bias, acts, pool, workers, 0, mid)
+		return true
+	}
+	return true
+}
+
+// enc_lin_rows is the encoder's linear: GPU+CPU row-split when the sidecar
+// is live and the shape qualifies, the pooled CPU kernels otherwise.
+enc_lin_rows :: proc(e: ^Encoder, out, x: Mat, w: Gguf_Tensor, bias: []f32) {
+	if gpu_lin_rows(out, x, w, bias, e.gpu, e.pool, e.workers) { return }
+	lin_rows_par(out, x, w, bias, e.pool, e.workers)
+}
+
+// engine_gpu_status reports whether dictation inference is using the GPU.
+// A nil sidecar (HEX_GPU unset) is not an error: it is the CPU default.
+engine_gpu_status :: proc(e: ^Engine) -> (enabled: bool, err: string) {
+	if e.enc.gpu == nil { return false, "" }
+	return e.enc.gpu.ok, e.enc.gpu.err
+}

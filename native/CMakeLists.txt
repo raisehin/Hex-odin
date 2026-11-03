@@ -3,11 +3,11 @@ project(hex_transcribe_shim CXX)
 
 # Builds the small C-ABI shim Odin loads at runtime (core:dynlib).
 #
-# The heavy half — ggml + transcribe.cpp + Vulkan shaders — is built once, on
-# its own, because it is slow and its CMake assumes it owns the source root:
+# The heavy half — ggml + transcribe.cpp — is built once, on its own, because it
+# is slow and its CMake assumes it owns the source root:
 #
 #   cmake -S native/third_party/transcribe.cpp -B native/build-transcribe \
-#         -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=OFF
+#         -DCMAKE_BUILD_TYPE=Release
 #   cmake --build native/build-transcribe --config Release --parallel
 #
 # Then this project links the resulting static libs. Set HEX_FETCH_TRANSCRIBE=ON
@@ -15,7 +15,7 @@ project(hex_transcribe_shim CXX)
 
 set(HEX_ROOT        "${CMAKE_CURRENT_SOURCE_DIR}")
 set(HEX_TRANSCRIBE  "${HEX_ROOT}/third_party/transcribe.cpp")
-set(HEX_TRANSCRIBE_BUILD "${HEX_ROOT}/build-transcribe")
+set(HEX_TRANSCRIBE_BUILD "${HEX_ROOT}/build-transcribe" CACHE PATH "prebuilt transcribe.cpp tree to link against")
 set(TRANSCRIBE_REV  "7045d1c0fe7cee37747b2792977421d435e75fca" CACHE STRING "anomalyco/transcribe.cpp revision")
 option(HEX_FETCH_TRANSCRIBE "Fetch transcribe.cpp instead of using third_party/" OFF)
 
@@ -33,7 +33,6 @@ if (HEX_FETCH_TRANSCRIBE)
   FetchContent_Declare(transcribe_cpp
     GIT_REPOSITORY https://github.com/anomalyco/transcribe.cpp
     GIT_TAG ${TRANSCRIBE_REV})
-  set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(transcribe_cpp)
   target_include_directories(transcribe_shim PRIVATE ${transcribe_cpp_SOURCE_DIR}/include)
   target_link_libraries(transcribe_shim PRIVATE transcribe ggml ggml-cpu ggml-base advapi32)

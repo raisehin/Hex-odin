@@ -42,6 +42,8 @@ main :: proc() {
 		if !paste_text(args[2]) { os.exit(1) }
 		// Keep the process alive long enough for the clipboard restore thread.
 		time.sleep(700 * time.Millisecond)
+	case "engine":
+		cmd_engine(args[2:])
 	case "threads":
 		cmd_threads(args[2:])
 	case "vad":
@@ -102,7 +104,32 @@ cmd_threads :: proc(args: []string) {
 	if n == 0 { fmt.println("threads: auto") } else { fmt.println("threads:", n) }
 }
 
+ENGINE_MODES :: [?]string{"auto", "phonon", "shim"}
+
+cmd_engine :: proc(args: []string) {
+	cfg := config_load()
+	if len(args) < 1 {
+		fmt.println(asr_engine_setting())
+		return
+	}
+	mode := args[0]
+	valid := false
+	for m in ENGINE_MODES { if m == mode { valid = true } }
+	if !valid {
+		fmt.eprint("usage: hex engine auto|phonon|shim\n")
+		os.exit(2)
+	}
+	cfg.engine = strings.clone(mode)
+	if !config_save(&cfg) { fmt.eprintln("could not save config"); os.exit(1) }
+	fmt.println("engine:", mode, "->", engine_name(asr_backend_for(cfg.model)))
+}
+
 cmd_vad :: proc(path: string) {
+	// Windows 11 may hold the process under EcoQoS, which caps clocks; the HUD
+	// clears it while recording, and the CLI has to do the same before the ASR
+	// runs. Measured on this box it is the difference between a stable ~350 ms
+	// and swings up to 1.7 s.
+	power_eco(false)
 	samples, _, ok := wav_read_mono16k(path)
 	if !ok { fmt.eprintln("could not read", path); os.exit(1) }
 	if !vad_load() { fmt.eprintln("vad model missing (silero-vad-v6.2-F32.gguf)"); os.exit(1) }
@@ -148,6 +175,7 @@ in-flight transcription so nothing is pasted.
   hex gguf <model.gguf>   inspect a GGUF model (--list for every tensor)
   hex mel <wav>           log-mel frontend stats (--dump for frame values)
   hex threads [n]         cap inference CPU workers (0 = all cores)
+  hex engine [mode]       auto | phonon (built-in kernels) | shim (transcribe.cpp)
   hex paste [mode]        ctrl_v | ctrl_shift_v | shift_insert | type
   hex devices             list capture endpoints and compute backends
   hex models [list|install <id>|check <id>]
@@ -165,6 +193,8 @@ cmd_status :: proc() {
 	fmt.println("shortcut :", cfg.shortcut)
 	fmt.println("paste    :", cfg.paste_keys)
 	if cfg.threads == 0 { fmt.println("threads  : auto") } else { fmt.println("threads  :", cfg.threads) }
+	fmt.println("engine   :", engine_name(asr_backend_for(cfg.model)))
+	fmt.println("setting  :", asr_engine_setting())
 	if transcribe_available() {
 		v := shim.version != nil ? string(shim.version()) : "?"
 		fmt.println("shim     : loaded", v)
@@ -233,20 +263,25 @@ cmd_record :: proc(out_path: string) {
 }
 
 cmd_transcribe :: proc(path: string, model_id := "", language := "") {
-	if !transcribe_available() {
-		fmt.eprintln("transcribe shim not built — run scripts/build-native.ps1")
-		os.exit(1)
-	}
-	samples, _, ok := wav_read_mono16k(path)
-	if !ok {
-		fmt.eprintln("could not read", path)
-		os.exit(1)
-	}
 	cfg := config_load()
 	use := model_id if len(model_id) > 0 else cfg.model
 	if m := model_by_id(use); m == nil {
 		fmt.eprintln("unknown model:", use)
 		os.exit(2)
+	}
+	if asr_backend_for(use) == .Shim && !transcribe_available() {
+		fmt.eprintln("transcribe shim not built — run scripts/build-native.ps1")
+		os.exit(1)
+	}
+	// Windows 11 may hold the process under EcoQoS, which caps clocks; the HUD
+	// clears it while recording, and the CLI has to do the same before the ASR
+	// runs. Measured on this box it is the difference between a stable ~350 ms
+	// and swings up to 1.7 s.
+	power_eco(false)
+	samples, _, ok := wav_read_mono16k(path)
+	if !ok {
+		fmt.eprintln("could not read", path)
+		os.exit(1)
 	}
 	text, err := transcribe_run(use, samples, language)
 	if err != "" {

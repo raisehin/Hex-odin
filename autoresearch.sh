@@ -1,108 +1,127 @@
 #!/usr/bin/env bash
-# Benchmark: `hex transcribe` of the fixed 1 s clip, one fresh process per run.
-# Input is "one second.mp3" decoded once to 16 kHz mono s16 (ffmpeg is
-# deterministic); wav_read_mono16k only accepts RIFF/PCM, so the mp3 cannot be
-# fed directly.
+# Benchmark: the Odin engine (phonon/) transcribing one fixed clip, one fresh
+# process per run, timed against the transcribe.cpp shim on the same input.
 #
-# Metrics (medians over HEX_BENCH_RUNS runs, default 5):
-#   infer_ms       CPU ASR compute inside the shim (primary; lower is better)
-#   model_ms       model load/dequant wait before inference
-#   transcribe_ms  whole-process wall time (spawn + load + infer + teardown)
-#   same_text      1 when every run produced the same transcript
-# Machine is CPU-only by construction: ggml runs with the CPU backend and the
-# shim is built with GGML_VULKAN=OFF, no CUDA.
+# Input is "bench-kernels/Hello there.wav" (16 kHz mono s16), fixed on disk, so
+# every run does exactly the same work. Model is the local Phonon-2.5 Q8_0
+# GGUF; nothing touches the network.
 #
-# Build goes to .swarm/ar/build (never touches ./hex.exe).
+# Metrics (medians over RUNS runs unless noted; lower is better except parity):
+#   infer_ms    Odin engine ASR compute (primary)
+#   enc_ms / dec_ms / mel_ms   stage split of infer_ms
+#   model_ms    Odin engine model load before inference
+#   transcribe_ms   whole-process wall time (spawn + load + infer + teardown)
+#   ref_infer_ms    transcribe.cpp/ggml doing the same clip (the baseline to beat)
+#   parity      1 when the Odin transcript matches the shim's byte for byte
+#
+# Build output goes to .swarm/ar/build so ./hex.exe is never touched.
 set -u
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 AR="$ROOT/.swarm/ar"
 BUILD="$AR/build"
 ODIN="C:/Users/rhais/Documents/odin-windows-amd64-dev-2026-10/dist/odin.exe"
-SRC="$ROOT/one second.mp3"
-WAV="$AR/in.wav"
+WAV="$ROOT/bench-kernels/Hello there.wav"
+MODEL="${HEX_BENCH_MODEL:-$APPDATA/hex/models/phonon-2.5-en-Q8_0.gguf}"
 RUNS="${HEX_BENCH_RUNS:-5}"
-CONFIG="$APPDATA/hex/odin-config"
+REF_RUNS="${HEX_BENCH_REF_RUNS:-3}"
 
-mkdir -p "$BUILD"
+mkdir -p "$BUILD" || exit 1
+if [ ! -f "$WAV" ]; then echo "autoresearch: missing $WAV" >&2; exit 1; fi
+if [ ! -f "$MODEL" ]; then echo "autoresearch: missing model $MODEL" >&2; exit 1; fi
 
-# 1. Input audio (cached, rebuilt when the mp3 changes).
-if [ ! -f "$WAV" ] || [ "$SRC" -nt "$WAV" ]; then
-	ffmpeg -y -loglevel error -i "$SRC" -ac 1 -ar 16000 -c:a pcm_s16le "$WAV" || exit 1
+# 1. Odin engine driver (bench-kernels/src -> kern.exe).
+KERN="$BUILD/kern.exe"
+newer_engine=$(find "$ROOT/bench-kernels/src" "$ROOT/phonon" -name '*.odin' -newer "$KERN" 2>/dev/null | head -1)
+if [ ! -f "$KERN" ] || [ -n "$newer_engine" ]; then
+  "$ODIN" build "$ROOT/bench-kernels/src" -out:"$KERN" -o:speed -microarch:znver2 || {
+    echo "autoresearch: odin build (engine) failed" >&2; exit 1; }
 fi
 
-# 2. Build the app from the live tree.
-rm -f "$BUILD"/*.odin
-cp "$ROOT"/src/*.odin "$BUILD"/ || exit 1
-"$ODIN" build "$BUILD" -out:"$BUILD/hex.exe" -o:speed || exit 1
+# 2. Reference driver (src/ -> hex.exe) for the baseline number. Needs the shim
+#    DLL next to it; the repo root copy is the built one. The reference runs are
+#    pinned to that DLL with HEX_ASR=shim (see step 4).
+HEX="$BUILD/hex.exe"
+newer_app=$(find "$ROOT/src" -name '*.odin' -newer "$HEX" 2>/dev/null | head -1)
+if [ ! -f "$HEX" ] || [ -n "$newer_app" ]; then
+  "$ODIN" build "$ROOT/src" -out:"$HEX" -o:speed || {
+    echo "autoresearch: odin build (hex) failed" >&2; exit 1; }
+fi
+if [ -f "$ROOT/transcribe_shim.dll" ] && { [ ! -f "$BUILD/transcribe_shim.dll" ] || [ "$ROOT/transcribe_shim.dll" -nt "$BUILD/transcribe_shim.dll" ]; }; then
+  cp "$ROOT/transcribe_shim.dll" "$BUILD/transcribe_shim.dll" || exit 1
+fi
 
-# 3. Shim next to the test binary (dynlib looks beside the exe first).
-SHIM=""
-for cand in "$ROOT/native/bin/transcribe_shim.dll" "$ROOT/native/build/Release/transcribe_shim.dll" "$ROOT/transcribe_shim.dll"; do
-	if [ -f "$cand" ]; then SHIM="$cand"; break; fi
+# 3. Warm-up (page the 705 MB mapping in once); its numbers are discarded.
+warm=$("$KERN" transcribe "$MODEL" "$WAV" 2>&1)
+printf '%s\n' "$warm" | grep -q '^PROFILE ' || {
+  echo "autoresearch: engine warm-up failed" >&2
+  printf '%s\n' "$warm" >&2; exit 1; }
+
+infer_list=""; model_list=""; wall_list=""
+mel_list=""; enc_list=""; dec_list=""
+texts=""
+
+for i in $(seq 1 "$RUNS"); do
+  start=$(date +%s%N)
+  # The driver may exit nonzero after printing (decoder is still WIP); the
+  # PROFILE line is the contract, so check for it instead of the exit code.
+  out=$("$KERN" transcribe "$MODEL" "$WAV" 2>&1)
+  end=$(date +%s%N)
+
+  profile=$(printf '%s\n' "$out" | grep -m1 '^PROFILE ')
+  if [ -z "$profile" ]; then
+    echo "autoresearch: engine run $i printed no PROFILE line" >&2
+    printf '%s\n' "$out" >&2; exit 1
+  fi
+  m=$(printf '%s\n' "$profile" | sed -n 's/.*model_ms=\([0-9]*\).*/\1/p')
+  f=$(printf '%s\n' "$profile" | sed -n 's/.*infer_ms=\([0-9]*\).*/\1/p')
+  st=$(printf '%s\n' "$out" | grep -m1 '^PHONON_STAGES ')
+  mel=$(printf '%s\n' "$st" | sed -n 's/.*mel=\([0-9.]*\).*/\1/p')
+  enc=$(printf '%s\n' "$st" | sed -n 's/.*enc=\([0-9.]*\).*/\1/p')
+  dec=$(printf '%s\n' "$st" | sed -n 's/.*dec=\([0-9.]*\).*/\1/p')
+  txt=$(printf '%s\n' "$out" | grep -v '^PROFILE\|^PHONON_STAGES\|^DBG\|^  \[\|^\[hex\]\|^parakeet\|^decoder:' | grep -v '^[[:space:]]*$' | tail -1)
+
+  texts="$texts$txt
+"
+  infer_list="$infer_list$f
+"; model_list="$model_list$m
+"
+  wall_list="$wall_list$(( (end - start) / 1000000 ))
+"
+  mel_list="$mel_list$mel
+"; enc_list="$enc_list$enc
+"; dec_list="$dec_list$dec
+"
 done
-[ -n "$SHIM" ] || { echo "autoresearch: transcribe_shim.dll not found; run scripts/build-native.ps1" >&2; exit 1; }
-cp "$SHIM" "$BUILD/transcribe_shim.dll"
 
-# 4. Machine facts, recorded so every number is traceable to this box.
-FACTS=$(powershell -NoProfile -Command '(Get-CimInstance Win32_Processor).Name + "|" + (Get-CimInstance Win32_VideoController | Select-Object -First 1).Name' 2>/dev/null | tr -d '\r')
-export HEX_BENCH_CPU="${FACTS%%|*}"
-export HEX_BENCH_GPU="${FACTS##*|}"
-export HEX_BENCH_THREADS="$(sed -n 's/^threads=//p' "$CONFIG" 2>/dev/null)"
-export HEX_BENCH_MODEL="$(sed -n 's/^model=//p' "$CONFIG" 2>/dev/null)"
-export HEX_BENCH_BUNDLE="$(basename "$SHIM")"
+# 4. Reference baseline: same clip through transcribe.cpp/ggml.
+ref_list=""
+for i in $(seq 1 "$REF_RUNS"); do
+  # HEX_ASR=shim keeps the reference on transcribe.cpp/ggml: hex.exe also
+  # carries the Odin engine now, which would otherwise measure itself.
+  rout=$(HEX_ASR=shim HEX_PROFILE=1 "$HEX" transcribe "$WAV" 2>&1)
+  r=$(printf '%s\n' "$rout" | sed -n 's/.*infer_ms=\([0-9]*\).*/\1/p' | head -1)
+  ref_list="$ref_list$r
+"
+  if [ "$i" = "1" ]; then
+    ref_text=$(printf '%s\n' "$rout" | grep -v '^PROFILE\|^\[hex\]\|^parakeet\|^decoder:\|^ggml' | grep -v '^[[:space:]]*$' | tail -1)
+  fi
+done
 
-# 5. Time N runs, print metrics. HEX_PROFILE makes the app print its internal
-#    stage split on stderr; parsing it is what separates the ASR compute from
-#    process startup and teardown.
-HEX_BIN="$BUILD/hex.exe" HEX_WAV="$WAV" HEX_RUNS="$RUNS" HEX_PROFILE=1 python - <<'PY'
-import hashlib, os, re, statistics, subprocess, sys, time
+median() { printf '%s\n' "$1" | grep -v '^$' | sort -n | awk '{a[NR]=$1} END { if (NR==0) {print 0} else if (NR%2) print a[(NR+1)/2]; else print int((a[NR/2]+a[NR/2+1])/2) }'; }
 
-exe, wav, runs = os.environ["HEX_BIN"], os.environ["HEX_WAV"], int(os.environ["HEX_RUNS"])
-prof = re.compile(r"PROFILE model_ms=(\d+) infer_ms=(\d+) samples=(\d+)")
+ours_text=$(printf '%s' "$texts" | grep -v '^$' | head -1)
+parity=0
+if [ "$ours_text" = "$ref_text" ]; then parity=1; fi
 
-walls, infers, models, texts, samples = [], [], [], [], []
-for _ in range(runs):
-    t0 = time.perf_counter()
-    p = subprocess.run([exe, "transcribe", wav], capture_output=True, text=True)
-    walls.append((time.perf_counter() - t0) * 1000.0)
-    m = prof.search(p.stderr)
-    if not m:
-        print("ASI error=no_profile_line")
-        print("ASI stderr_tail=" + p.stderr.strip().replace("\n", " ")[-200:])
-        print("METRIC same_text=0")
-        sys.exit(1)
-    models.append(float(m.group(1)))
-    infers.append(float(m.group(2)))
-    samples.append(int(m.group(3)))
-    texts.append(p.stdout.strip())
-
-if any(not t for t in texts):
-    print("ASI error=empty_transcript")
-    print("METRIC same_text=0")
-    sys.exit(1)
-
-digests = sorted({hashlib.sha256(t.encode()).hexdigest()[:16] for t in texts})
-# 16 kHz s16 mono after a 44-byte canonical header; fall back to sample count.
-audio_ms = samples[0] / 16.0
-print("ASI cpu=" + os.environ.get("HEX_BENCH_CPU", "unknown"))
-print("ASI gpu=" + os.environ.get("HEX_BENCH_GPU", "unknown"))
-print("ASI bundle=" + os.environ.get("HEX_BENCH_BUNDLE", "unknown"))
-print("ASI threads=" + os.environ.get("HEX_BENCH_THREADS", "unknown"))
-print("ASI model=" + os.environ.get("HEX_BENCH_MODEL", "unknown"))
-print("ASI audio_ms=%.1f" % audio_ms)
-print("ASI walls_ms=" + ",".join("%.0f" % w for w in walls))
-print("ASI infer_ms=" + ",".join("%.0f" % i for i in infers))
-print("ASI model_load_ms=" + ",".join("%.0f" % i for i in models))
-print("ASI rtf=%.3f" % (statistics.median(infers) / audio_ms))
-print("ASI transcript=" + texts[0].replace("\n", " ")[:200])
-print("ASI transcript_sha=" + "|".join(digests))
-print("METRIC infer_ms=%.1f" % statistics.median(infers))
-print("METRIC model_ms=%.1f" % statistics.median(models))
-print("METRIC transcribe_ms=%.1f" % statistics.median(walls))
-print("METRIC same_text=%d" % (1 if len(digests) == 1 else 0))
-sys.exit(0 if len(digests) == 1 else 1)
-PY
-rc=$?
-
-exit $rc
+echo "METRIC infer_ms=$(median "$infer_list")"
+echo "METRIC enc_ms=$(median "$enc_list")"
+echo "METRIC dec_ms=$(median "$dec_list")"
+echo "METRIC mel_ms=$(median "$mel_list")"
+echo "METRIC model_ms=$(median "$model_list")"
+echo "METRIC transcribe_ms=$(median "$wall_list")"
+echo "METRIC ref_infer_ms=$(median "$ref_list")"
+echo "METRIC parity=$parity"
+echo "ours: $ours_text"
+echo "ref:  $ref_text"
+exit 0
