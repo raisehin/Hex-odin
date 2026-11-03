@@ -255,6 +255,10 @@ Encode_Stats :: struct {
 	attn_sc:  f64, // score_rows (incl. softmax)
 	attn_av:  f64, // av_rows
 	attn_out: f64, // linear_out
+	// GPU split-internal breakdown: upload vs launch/join/scatter.
+	gpu_up:   f64, // scratch_write_acts
+	gpu_join: f64, // gemm_finish_strided (fence wait + scatter)
+	gpu_span: f64, // lin_rows_par_span wall (CPU half)
 	conv:       f64,
 	conv_glu:   f64,
 	conv_dw:    f64,

@@ -105,9 +105,10 @@ Scratch :: struct {
 	blocks:    int,
 	act_q:     ^Buffer, // [t][k] int8
 	act_d:     ^Buffer, // [t][blocks] f32
-	out:       ^Buffer, // [t][n] f32 device-side
-	readback:  ^Buffer, // [t][n] f32 host-visible
+	out:       ^Buffer, // [t][n] f32 device-side (slots array for batched use)
+	readback:  ^Buffer, // [t][n] f32 host-visible (slots array for batched use)
 	out_state: d3d12.RESOURCE_STATES,
+	slots:     int, // how many [t][n] output slots out/readback hold
 }
 
 scratch_create :: proc(g: ^Gpu, n, k, t: int) -> (s: ^Scratch, err: string) {
@@ -129,6 +130,7 @@ scratch_create :: proc(g: ^Gpu, n, k, t: int) -> (s: ^Scratch, err: string) {
 		scratch_destroy(s); return nil, err
 	}
 	s.out_state = STATE_COMMON
+	s.slots = 1
 	return s, ""
 }
 
@@ -165,6 +167,70 @@ gemm_constants :: proc(w: ^Weights, s: ^Scratch, n_out: int) -> ([ROOT_CONSTANT_
 		1,
 	}
 	return constants, groups
+}
+
+// scratch_ensure_slots grows the scratch to hold nslots batched outputs.
+scratch_ensure_slots :: proc(s: ^Scratch, nslots: int) -> string {
+	if s.slots >= nslots { return "" }
+	g := s.g
+	if s.out != nil { buffer_destroy(s.out) }
+	if s.readback != nil { buffer_destroy(s.readback) }
+	s.out = nil
+	s.readback = nil
+	bytes := u64(nslots * s.t * s.n * 4)
+	out, err := buffer_create(g, bytes, .DEFAULT, STATE_COMMON, {.ALLOW_UNORDERED_ACCESS})
+	if err != "" { return err }
+	rb, rerr := buffer_create(g, bytes, .READBACK, STATE_COPY_DEST)
+	if rerr != "" { buffer_destroy(out); return rerr }
+	s.out = out
+	s.readback = rb
+	s.out_state = STATE_COMMON
+	s.slots = nslots
+	return ""
+}
+
+// gemm_launch_batch3 submits three GEMMs that share one activation buffer
+// (the q/k/v projections) into a single command list with one fence signal.
+// Each lands in its own output slot, so the three CPU halves can run
+// back-to-back and one join covers all three.
+// Numerically identical: same shader, same constants, same row range.
+gemm_launch_batch3 :: proc(g: ^Gpu, ws: [3]^Weights, s: ^Scratch, n_out: int) -> string {
+	if n_out <= 0 { return fmt.tprintf("gemm_launch_batch3: n_out=%d", n_out) }
+	if s.slots < 3 { return fmt.tprintf("gemm_launch_batch3: scratch has %d slots, want 3", s.slots) }
+	entries: [3]Dispatch_Entry
+	for w, i in ws {
+		if w == nil { return "gemm_launch_batch3: nil weights" }
+		if n_out > w.n { return fmt.tprintf("gemm_launch_batch3: n_out=%d for %d rows", n_out, w.n) }
+		if s.n != n_out || s.k != w.k { return "gemm_launch_batch3: weights/scratch shape mismatch" }
+		constants, groups := gemm_constants(w, s, n_out)
+		entries[i] = Dispatch_Entry {
+			groups    = groups,
+			constants = constants,
+			srvs      = [ROOT_SRV_COUNT]^Buffer{w.q, w.d, s.act_q, s.act_d, w.bias},
+		}
+	}
+	slot_bytes := u64(s.t * n_out * 4)
+	err := dispatch_launch_batch(g, entries[:], s.out, s.out_state, s.readback, slot_bytes)
+	if err == "" { s.out_state = STATE_COPY_SOURCE }
+	return err
+}
+
+// gemm_finish_strided_slot is gemm_finish_strided for one slot of a batched
+// submission: waits once and scatters that slot's rows into dst pitched by
+// n_full.
+gemm_finish_strided_slot :: proc(g: ^Gpu, s: ^Scratch, dst: []f32, n_full, slot: int) -> (err: string) {
+	t, mid := s.t, s.n
+	if len(dst) != t * n_full { return fmt.tprintf("gemm_finish_strided_slot: dst has %d, want %d", len(dst), t * n_full) }
+	if mid > n_full { return fmt.tprintf("gemm_finish_strided_slot: mid %d exceeds pitch %d", mid, n_full) }
+	if s.readback.mapped == nil { return "gemm_finish_strided_slot: readback not mapped" }
+	if err = gpu_join(g); err != "" { return err }
+	slot_bytes := u64(t * mid * 4)
+	base := cast([^]u8)s.readback.mapped
+	src := base[uintptr(u64(slot)*slot_bytes):]
+	for f in 0 ..< t {
+		mem.copy(&dst[f*n_full], rawptr(&src[uintptr(f*mid*4)]), mid*4)
+	}
+	return ""
 }
 
 // gemm_launch submits one GEMM for output rows [0, n_out) without waiting,
