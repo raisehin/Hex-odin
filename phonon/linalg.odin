@@ -446,6 +446,61 @@ norm_mat :: proc(dst, src: Mat, gamma, beta: []f32) #no_bounds_check {
 	}
 }
 
+// Norm_Task is one pooled norm_mat dispatch.
+@(private = "file")
+Norm_Task :: struct {
+	dst, src, gamma, beta: []f32,
+	cols:                 int,
+	par:                  bool,
+}
+
+@(private = "file")
+norm_chunk :: proc(data: rawptr, lo, hi: int) {
+	t := cast(^Norm_Task)data
+	for i in lo ..< hi {
+		layer_norm_into(t.dst[i * t.cols:][:t.cols], t.src[i * t.cols:][:t.cols], t.gamma, t.beta)
+	}
+}
+
+// norm_mat_par is norm_mat with the rows spread over the pool. A row is an
+// output axis - mean/variance inside a row keep their exact serial order - so
+// every row's bits are unchanged. Small shapes stay serial to protect the
+// short clip.
+norm_mat_par :: proc(dst, src: Mat, gamma, beta: []f32, pool: ^Pool, workers: int) {
+	if src.rows < 32 || pool == nil || workers < 2 {
+		norm_mat(dst, src, gamma, beta)
+		return
+	}
+	ctx := Norm_Task {
+		dst   = dst.data,
+		src   = src.data,
+		gamma = gamma,
+		beta  = beta,
+		cols  = src.cols,
+		par   = true,
+	}
+	par_chunks(pool, workers, src.rows, norm_chunk, &ctx)
+}
+
+// layer_norm_rows_par is layer_norm_rows (in-place) spread over the pool.
+layer_norm_rows_par :: proc(m: Mat, gamma, beta: []f32, pool: ^Pool, workers: int) {
+	if m.rows < 32 || pool == nil || workers < 2 {
+		layer_norm_rows(m, gamma, beta)
+		return
+	}
+	// In-place: dst and src are the same buffer, which norm_chunk allows
+	// because layer_norm_into only touches row i of both.
+	ctx := Norm_Task {
+		dst   = m.data,
+		src   = m.data,
+		gamma = gamma,
+		beta  = beta,
+		cols  = m.cols,
+		par   = true,
+	}
+	par_chunks(pool, workers, m.rows, norm_chunk, &ctx)
+}
+
 // layer_norm_rows normalises every row of m in place.
 layer_norm_rows :: proc(m: Mat, gamma, beta: []f32) #no_bounds_check {
 	for i in 0 ..< m.rows {

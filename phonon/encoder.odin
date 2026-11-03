@@ -251,6 +251,10 @@ Encode_Stats :: struct {
 	attn:       f64,
 	attn_qkv:   f64, // linear_q/k/v + the pos projection
 	attn_score: f64, // scores, softmax, AV, linear_out
+	// finer split of attn_score: which of the four terms actually costs.
+	attn_sc:  f64, // score_rows (incl. softmax)
+	attn_av:  f64, // av_rows
+	attn_out: f64, // linear_out
 	conv:       f64,
 	conv_glu:   f64,
 	conv_dw:    f64,
@@ -459,9 +463,13 @@ attention :: proc(e: ^Encoder, layer: int, x: Mat, out: Mat) {
 		H = H, T = T, hd = hd,
 		scale = f32(1) / math.sqrt(f32(hd)),
 	}
+	ts := time.tick_now()
 	par_chunks(e.pool, e.workers, H * T, score_rows, &st)
+	if e.stats != nil { e.stats.attn_sc += ms_since(ts) }
 	at := AV_Task {scores = e.ws.scores, v = v, out = out, H = H, T = T, hd = hd}
+	ta := time.tick_now()
 	par_chunks(e.pool, e.workers, T, av_rows, &at)
+	if e.stats != nil { e.stats.attn_av += ms_since(ta) }
 }
 
 // The attention score and value-mixing phases are O(T^2) with an unvectorised
@@ -482,24 +490,47 @@ Score_Task :: struct {
 }
 
 @(private = "file")
-score_rows :: proc(ctx: rawptr, lo, hi: int) {
+score_rows :: proc(ctx: rawptr, lo, hi: int) #no_bounds_check {
 	t := cast(^Score_Task)ctx
 	H, T, hd := t.H, t.T, t.hd
 	tt := T * T
+	// qi+bu and qi+bv do not depend on j, yet the j loop recomputed them for
+	// every j: the same two adds, once per (h,i) instead of once per (h,i,j).
+	// Same operands, same single add -> bit-identical.
+	Aq_Scratch :: [512]f32
+	aq_buf: Aq_Scratch
+	bq_buf: Aq_Scratch
+	aplane: []f32
+	bplane: []f32
+	if hd <= len(aq_buf) {
+		aplane = aq_buf[:hd]
+		bplane = bq_buf[:hd]
+	} else {
+		aplane = make([]f32, hd, context.temp_allocator)
+		bplane = make([]f32, hd, context.temp_allocator)
+		defer {
+			delete(aplane, context.temp_allocator)
+			delete(bplane, context.temp_allocator)
+		}
+	}
 	for r in lo ..< hi {
 		h := r / T
 		i := r % T
 		off := h * hd
 		qi := mat_row(t.q, i)[off:][:hd]
 		row := t.scores[h * tt + i * T:][:T]
+		for dd in 0 ..< hd {
+			aplane[dd] = qi[dd] + t.bu[off + dd]
+			bplane[dd] = qi[dd] + t.bv[off + dd]
+		}
 		for j in 0 ..< T {
 			kj := mat_row(t.k, j)[off:][:hd]
 			ac: f32 = 0
-			for dd in 0 ..< hd { ac += (qi[dd] + t.bu[off + dd]) * kj[dd] }
+			for dd in 0 ..< hd { ac += aplane[dd] * kj[dd] }
 			// position term for index (j + T - 1 - i)
 			pj := mat_row(t.p, j + T - 1 - i)[off:][:hd]
 			bd: f32 = 0
-			for dd in 0 ..< hd { bd += (qi[dd] + t.bv[off + dd]) * pj[dd] }
+			for dd in 0 ..< hd { bd += bplane[dd] * pj[dd] }
 			row[j] = t.scale * (ac + bd)
 		}
 		softmax(row)
@@ -514,7 +545,7 @@ AV_Task :: struct {
 }
 
 @(private = "file")
-av_rows :: proc(ctx: rawptr, lo, hi: int) {
+av_rows :: proc(ctx: rawptr, lo, hi: int) #no_bounds_check {
 	t := cast(^AV_Task)ctx
 	H, T, hd := t.H, t.T, t.hd
 	tt := T * T
@@ -658,7 +689,7 @@ block :: proc(e: ^Encoder, layer: int, x: Mat) {
 	// up inside the frame loop; bw carries all of them, resolved at load.
 	t0 := time.tick_now()
 	// macaron ff1 at 0.5
-	norm_mat(a, x, bw.norm_ff1_w, bw.norm_ff1_b)
+	norm_mat_par(a, x, bw.norm_ff1_w, bw.norm_ff1_b, e.pool, e.workers)
 	if e.stats != nil { e.stats.norm += ms_since(t0) }
 	ffn(e, bw.ff1_l1, bw.ff1_l2, a, b)
 	t0 = time.tick_now()
@@ -668,11 +699,13 @@ block :: proc(e: ^Encoder, layer: int, x: Mat) {
 
 	// self-attention
 	t0 = time.tick_now()
-	norm_mat(a, x, bw.norm_attn_w, bw.norm_attn_b)
+	norm_mat_par(a, x, bw.norm_attn_w, bw.norm_attn_b, e.pool, e.workers)
 	if e.stats != nil { e.stats.norm += ms_since(t0) }
 	t0 = time.tick_now()
 	attention(e, layer, a, b)
+	to := time.tick_now()
 	enc_lin_rows(e, a, b, bw.attn_out, nil)
+	if e.stats != nil { e.stats.attn_out += ms_since(to) }
 	if e.stats != nil { e.stats.attn_score += ms_since(t0) }
 	t0 = time.tick_now()
 	add_scaled(x, a, 1.0)
@@ -681,7 +714,7 @@ block :: proc(e: ^Encoder, layer: int, x: Mat) {
 
 	// convolution module
 	t0 = time.tick_now()
-	norm_mat(a, x, bw.norm_conv_w, bw.norm_conv_b)
+	norm_mat_par(a, x, bw.norm_conv_w, bw.norm_conv_b, e.pool, e.workers)
 	if e.stats != nil { e.stats.norm += ms_since(t0) }
 	conv_module(e, layer, a, b)
 	t0 = time.tick_now()
@@ -691,7 +724,7 @@ block :: proc(e: ^Encoder, layer: int, x: Mat) {
 
 	// macaron ff2 at 0.5
 	t0 = time.tick_now()
-	norm_mat(a, x, bw.norm_ff2_w, bw.norm_ff2_b)
+	norm_mat_par(a, x, bw.norm_ff2_w, bw.norm_ff2_b, e.pool, e.workers)
 	if e.stats != nil { e.stats.norm += ms_since(t0) }
 	ffn(e, bw.ff2_l1, bw.ff2_l2, a, b)
 	t0 = time.tick_now()
@@ -701,7 +734,7 @@ block :: proc(e: ^Encoder, layer: int, x: Mat) {
 
 	// out norm
 	t0 = time.tick_now()
-	layer_norm_rows(x, bw.norm_out_w, bw.norm_out_b)
+	layer_norm_rows_par(x, bw.norm_out_w, bw.norm_out_b, e.pool, e.workers)
 	if e.stats != nil { e.stats.norm += ms_since(t0) }
 }
 

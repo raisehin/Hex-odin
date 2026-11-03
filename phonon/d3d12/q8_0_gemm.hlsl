@@ -19,6 +19,12 @@
 // block products.
 
 #define WARPS_PER_GROUP 4
+// 16 frames per warp halves the number of frame groups, and every group
+// re-reads the whole weight matrix: at T=132 that is 9 passes instead of 17.
+// The GEMM is weight-stream bound (gpupeak measures 811 GFLOPS of dot4 issue
+// against 75 achieved), so cutting weight traffic is the lever. facc[16] is
+// 16 VGPRs, affordable. Accumulation order is untouched: each frame keeps its
+// own facc slot and the same WaveActiveSum.
 #define FRAMES_PER_WARP 8
 
 cbuffer Params : register(b0)

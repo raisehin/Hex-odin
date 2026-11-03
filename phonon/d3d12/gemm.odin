@@ -24,6 +24,8 @@ Q8_0_GEMM_DXIL: []u8 = #load("q8_0_gemm.dxil")
 
 MAX_K :: 4096
 WARPS_PER_GROUP :: 4
+// Must mirror FRAMES_PER_WARP in q8_0_gemm.hlsl: it sizes groups[1] and the
+// per-warp frame tile. Changing one without the other silently mislaunches.
 FRAMES_PER_WARP :: 8
 
 Weights :: struct {

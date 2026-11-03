@@ -30,6 +30,7 @@ usage :: proc() {
 	fmt.eprintln("       kern gpu <gguf> [tensor] [frames] [reps] [threads]")
 	fmt.eprintln("       kern gpupeak [groups] [iters] [reps]")
 	fmt.eprintln("       kern gpuenc <gguf> <wav> [threads]  (CPU vs HEX_GPU=1 dictation check)")
+	fmt.eprintln("       kern enchash <gguf> [frames] [threads]  (deterministic encode, FNV hash oracle)")
 	os.exit(2)
 }
 
@@ -46,8 +47,50 @@ main :: proc() {
 	case "gpu":        cmd_gpu(args)
 	case "gpupeak":    cmd_gpupeak(args)
 	case "gpuenc":     cmd_gpuenc(args)
+	case "enchash":    cmd_enchash(args)
 	case:              usage()
 	}
+}
+
+// --- bit-identity oracle ---------------------------------------------------
+
+// cmd_enchash runs the encoder over a deterministic synthetic mel plane and
+// prints an FNV-1a hash of the output bits. Two builds that print the same
+// hash computed bit-identical results; any summation-order change shows up as
+// a different hash even when the transcript survives. This is the check the
+// "bit-identical by construction" claims are verified against.
+cmd_enchash :: proc(args: []string) {
+	model := args[2]
+	frames := 132
+	workers := 8
+	if len(args) > 3 { frames, _ = strconv.parse_int(args[3]) }
+	if len(args) > 4 { workers, _ = strconv.parse_int(args[4]) }
+
+	e, err := phonon.engine_open(model, workers)
+	if err != "" { fmt.eprintln("engine:", err); os.exit(1) }
+	defer phonon.engine_close(&e)
+
+	n_mels := 128
+	mel := make([]f32, n_mels * frames, context.temp_allocator)
+	// Deterministic LCG so the input is identical across builds and runs.
+	s := u32(0x1234_5678)
+	for &v in mel {
+		s = s * 1664525 + 1013904223
+		v = f32(i32(s >> 8) - 0x80_0000) / f32(0x80_0000)
+	}
+
+	enc := phonon.encode(&e.enc, mel, n_mels, frames, context.temp_allocator)
+	fmt.printf("ENCHASH frames=%d threads=%d rows=%d cols=%d\n", frames, workers, enc.rows, enc.cols)
+
+	h := u32(2166136261)
+	nan := 0
+	for v in enc.data {
+		bits := transmute(u32)v
+		// non-finite: exponent all ones
+		if (bits & 0x7F80_0000) == 0x7F80_0000 { nan += 1 }
+		h = (h ~ bits) * 16777619
+	}
+	fmt.printf("ENCHASH hash=%08x elements=%d nonfinite=%d\n", h, len(enc.data), nan)
 }
 
 // --- encoder matmul bench --------------------------------------------------

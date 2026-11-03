@@ -260,4 +260,6 @@ cmd_gpuenc :: proc(args: []string) {
 	fmt.printf("GPUENC enc_final max_abs=%.3e mean_abs=%.3e max_rel=%.3e\n", max_abs, mean_abs, max_rel)
 	fmt.printf("GPUENC stages attn_qkv=%.1f attn_score=%.1f ffn=%.1f conv=%.1f norm=%.1f resid=%.1f\n",
 		stats.attn_qkv, stats.attn_score, stats.ffn, stats.conv, stats.norm, stats.resid)
+	fmt.printf("GPUENC attn_split sc=%.1f av=%.1f out=%.1f\n",
+		stats.attn_sc, stats.attn_av, stats.attn_out)
 }
