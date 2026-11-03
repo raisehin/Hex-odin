@@ -9,8 +9,10 @@
 // CPU kernels instead; a dispatch error additionally poisons the sidecar so
 // the rest of the utterance stays on the CPU path.
 //
-// Selection is explicit: HEX_GPU=1 (or d3d12/gpu) enables the device at engine
-// open. Unset means Center CPU, no device, no extra memory.
+// The device is opened by default. HEX_GPU=0 (or off/false/no/cpu/none) opts out
+// and keeps the engine CPU-only; any value that is not an explicit opt-out tries
+// the device, and a failed open leaves a nil sidecar, which every caller already
+// treats as "run the CPU kernel".
 
 package phonon
 
@@ -27,9 +29,20 @@ Gpu_Enc :: struct {
 	scratch: map[[3]int]^d3d12.Scratch,
 }
 
+// gpu_enc_wanted reports whether to try opening the D3D12 sidecar. The hybrid
+// split is ON by default: a device that cannot be opened, or a failure part-way
+// through an utterance, poisons the sidecar and the rest of that run falls back
+// to the CPU kernels, so a machine without a usable GPU pays one failed open
+// and then behaves exactly as before. HEX_GPU=0 (or off/false/no/cpu/none) opts
+// out and keeps the engine CPU-only -- which is what the benchmark uses to pin
+// its CPU arm.
 gpu_enc_wanted :: proc() -> bool {
 	v := os.get_env("HEX_GPU", context.temp_allocator)
-	return v == "1" || v == "d3d12" || v == "gpu"
+	switch v {
+	case "0", "off", "false", "no", "cpu", "none":
+		return false
+	}
+	return true
 }
 
 gpu_enc_open :: proc() -> ^Gpu_Enc {
