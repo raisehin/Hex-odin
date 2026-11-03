@@ -27,6 +27,9 @@ usage :: proc() {
 	fmt.eprintln("       kern parity <gguf> <wav> <dump_dir>")
 	fmt.eprintln("       kern parity-enc <gguf> <dump_dir>   (encoder stages only, ref mel in)")
 	fmt.eprintln("       kern parcheck <gguf> [threads] [tensor]")
+	fmt.eprintln("       kern gpu <gguf> [tensor] [frames] [reps] [threads]")
+	fmt.eprintln("       kern gpupeak [groups] [iters] [reps]")
+	fmt.eprintln("       kern gpuenc <gguf> <wav> [threads]  (CPU vs HEX_GPU=1 dictation check)")
 	os.exit(2)
 }
 
@@ -40,6 +43,9 @@ main :: proc() {
 	case "parity-enc": cmd_parity_enc(args)
 	case "types":      cmd_types(args)
 	case "parcheck":   cmd_parcheck(args)
+	case "gpu":        cmd_gpu(args)
+	case "gpupeak":    cmd_gpupeak(args)
+	case "gpuenc":     cmd_gpuenc(args)
 	case:              usage()
 	}
 }
@@ -53,13 +59,14 @@ main :: proc() {
 cmd_encoder :: proc(args: []string) {
 	frames := 13
 	workers := 0
+	passes_n := 5
 	if len(args) > 3 { frames, _ = strconv.parse_int(args[3]) }
 	if len(args) > 4 { workers, _ = strconv.parse_int(args[4]) }
+	if len(args) > 5 { passes_n, _ = strconv.parse_int(args[5]) }
 
 	g, err := phonon.gguf_load(args[2])
 	if err != "" { fmt.eprintln(err); os.exit(1) }
 	defer phonon.gguf_destroy(&g)
-
 	pool := phonon.thread_pool_make(workers)
 	defer phonon.thread_pool_free(pool)
 	nthreads := pool == nil ? 1 : len(pool.threads)
@@ -70,6 +77,13 @@ cmd_encoder :: proc(args: []string) {
 	count_type: map[phonon.GGML_Type]int
 	bytes_type: map[phonon.GGML_Type]int
 	reps :: 3
+	// One pass over every tensor is a noisy sample on a shared laptop: repeat
+	// the whole sweep and report the spread, so a change smaller than the
+	// run-to-run drift is still visible as a min shift.
+	pass_totals := make([dynamic]f64)
+	defer delete(pass_totals)
+	for pass in 0 ..< passes_n {
+	pass_sum: f64 = 0
 	for name in g.order {
 		t := g.tensors[name]
 		if t.n_dims != 2 || (t.type != .Q8_0 && t.type != .F16 && t.type != .F32) { continue }
@@ -89,6 +103,7 @@ cmd_encoder :: proc(args: []string) {
 		if true {
 		}
 		total += el
+		pass_sum += el
 		macs += f64(rows) * f64(cols) * f64(frames)
 			if len(name) > 22 && name[:22] == "enc.pre_encode.out.wei" { s: f64 = 0; for v in out.data { s += f64(v) }; fmt.printf("  chk %s threads=%d y0=%.6f sum=%.4f\n", name, nthreads, out.data[0], s) }
 		per_type[t.type] += el
@@ -101,8 +116,20 @@ cmd_encoder :: proc(args: []string) {
 		if count_type[t] == 0 { continue }
 		fmt.printf("  %-4v %3d tensors %6.1f MB %9.2f ms\n", t, count_type[t], f64(bytes_type[t])/1e6, per_type[t])
 	}
-	fmt.printf("KERN encoder_matmul frames=%d threads=%d total_ms=%.2f gflop=%.1f gflops=%.1f\n",
-		frames, nthreads, total, 2 * macs / 1e9, 2 * macs / 1e9 / (total / 1000))
+	append(&pass_totals, pass_sum)
+	}
+	best := pass_totals[0]
+	for v in pass_totals { if v < best { best = v } }
+	mean: f64
+	for v in pass_totals { mean += v }
+	mean /= f64(len(pass_totals))
+	if passes_n > 1 {
+		fmt.printf("  passes:", )
+		for v in pass_totals { fmt.printf(" %.1f", v) }
+		fmt.println()
+	}
+	fmt.printf("KERN encoder_matmul frames=%d threads=%d total_ms=%.2f min_ms=%.2f mean_ms=%.2f passes=%d gflop=%.1f gflops=%.1f\n",
+		frames, nthreads, best, best, mean, passes_n, 2 * macs / 1e9, 2 * macs / 1e9 / (best / 1000))
 }
 
 
@@ -204,7 +231,7 @@ cmd_transcribe :: proc(args: []string) {
 // reports the first divergent output row. A mismatch means a worker produced a
 // row range it should not have, which is a bug in the pool, not in the kernel.
 cmd_parcheck :: proc(args: []string) {
-	tensor := "enc.blocks.0.ffn.linear1.weight"
+	tensor := "enc.blocks.0.ff1.linear1.weight"
 	workers := 8
 	if len(args) > 3 { workers, _ = strconv.parse_int(args[3]) }
 	if len(args) > 4 { tensor = args[4] }

@@ -277,6 +277,9 @@ Encoder :: struct {
 	alloc: mem.Allocator,
 	pool:     ^Pool,
 	workers:  int,
+	// gpu, when non-nil, runs the Q8_0 linears on D3D12 (HEX_GPU=1); nil is
+	// the CPU default, and any GPU failure falls back per linear.
+	gpu:      ^Gpu_Enc,
 	T:     int, // encoder frames
 	// trace, when set, is called with every named stage tensor; the parity
 	// harness uses it to diff against reference dumps. Nil in production.
@@ -310,6 +313,9 @@ encoder_init :: proc(e: ^Encoder, g: ^Gguf, pool: ^Pool, alloc := context.alloca
 	e.bw = make([]Block_Weights, e.cfg.n_layers, alloc)
 	for l in 0 ..< e.cfg.n_layers { e.bw[l] = block_weights(g, l) }
 	encoder_resize(e, 0)
+	// Explicit opt-in: HEX_GPU=1 opens the D3D12 device here. A nil sidecar
+	// is the CPU default; a failed open degrades to CPU per linear.
+	e.gpu = gpu_enc_open_if_enabled()
 }
 
 encoder_resize :: proc(e: ^Encoder, T: int) {
@@ -348,6 +354,8 @@ encoder_resize :: proc(e: ^Encoder, T: int) {
 }
 
 encoder_destroy :: proc(e: ^Encoder) {
+	gpu_enc_close(e.gpu)
+	e.gpu = nil
 	alloc := e.alloc
 	mat_destroy(&e.ws.a, alloc)
 	mat_destroy(&e.ws.b, alloc)
@@ -419,7 +427,7 @@ pre_encode :: proc(e: ^Encoder, mel: []f32, n_mels, frames: int, alloc := contex
 	}
 	pre_mark(e, 6, &_pt)
 	out := mat_make(T, cfg.d_model, alloc)
-	lin_rows_par(out, Mat{rows = T, cols = C * f6, data = stacked}, wt(g, "enc.pre_encode.out.weight"), fb(g, "enc.pre_encode.out.bias"), e.pool, e.workers)
+	enc_lin_rows(e, out, Mat{rows = T, cols = C * f6, data = stacked}, wt(g, "enc.pre_encode.out.weight"), fb(g, "enc.pre_encode.out.bias"))
 	pre_mark(e, 7, &_pt)
 	return out
 }
@@ -433,11 +441,11 @@ attention :: proc(e: ^Encoder, layer: int, x: Mat, out: Mat) {
 
 	t0 := time.tick_now()
 	q, k, v, p := e.ws.q, e.ws.k, e.ws.v, e.ws.p
-	lin_rows_par(q, x, bw.attn_q, nil, e.pool, e.workers)
-	lin_rows_par(k, x, bw.attn_k, nil, e.pool, e.workers)
-	lin_rows_par(v, x, bw.attn_v, nil, e.pool, e.workers)
+	enc_lin_rows(e, q, x, bw.attn_q, nil)
+	enc_lin_rows(e, k, x, bw.attn_k, nil)
+	enc_lin_rows(e, v, x, bw.attn_v, nil)
 
-	lin_rows_par(p, e.ws.pe, bw.attn_pos, nil, e.pool, e.workers)
+	enc_lin_rows(e, p, e.ws.pe, bw.attn_pos, nil)
 
 	if e.stats != nil { e.stats.attn_qkv += ms_since(t0) }
 
@@ -584,7 +592,7 @@ conv_module :: proc(e: ^Encoder, layer: int, x: Mat, out: Mat) {
 
 	t0 := time.tick_now()
 	hw := e.ws.conv
-	lin_rows_par(hw, x, bw.conv_pw1, nil, e.pool, e.workers)
+	enc_lin_rows(e, hw, x, bw.conv_pw1, nil)
 	if e.stats != nil { e.stats.conv += ms_since(t0) }
 	t0 = time.tick_now()
 	a := e.ws.c
@@ -622,7 +630,7 @@ conv_module :: proc(e: ^Encoder, layer: int, x: Mat, out: Mat) {
 	}
 	if e.stats != nil { e.stats.conv_dw += ms_since(t0) }
 	t0 = time.tick_now()
-	lin_rows_par(out, b, bw.conv_pw2, nil, e.pool, e.workers)
+	enc_lin_rows(e, out, b, bw.conv_pw2, nil)
 	if e.stats != nil { e.stats.conv_pw2 += ms_since(t0) }
 }
 
@@ -630,13 +638,13 @@ conv_module :: proc(e: ^Encoder, layer: int, x: Mat, out: Mat) {
 ffn :: proc(e: ^Encoder, w1, w2: Gguf_Tensor, x: Mat, out: Mat) {
 	ff := e.ws.ff
 	t0 := time.tick_now()
-	lin_rows_par(ff, x, w1, nil, e.pool, e.workers)
+	enc_lin_rows(e, ff, x, w1, nil)
 	if e.stats != nil { e.stats.ffn += ms_since(t0) }
 	t0 = time.tick_now()
 	silu_par(ff, e.pool, e.workers)
 	if e.stats != nil { e.stats.silu += ms_since(t0) }
 	t0 = time.tick_now()
-	lin_rows_par(out, ff, w2, nil, e.pool, e.workers)
+	enc_lin_rows(e, out, ff, w2, nil)
 	if e.stats != nil { e.stats.ffn += ms_since(t0) }
 }
 
@@ -662,7 +670,7 @@ block :: proc(e: ^Encoder, layer: int, x: Mat) {
 	if e.stats != nil { e.stats.norm += ms_since(t0) }
 	t0 = time.tick_now()
 	attention(e, layer, a, b)
-	lin_rows_par(a, b, bw.attn_out, nil, e.pool, e.workers)
+	enc_lin_rows(e, a, b, bw.attn_out, nil)
 	if e.stats != nil { e.stats.attn_score += ms_since(t0) }
 	t0 = time.tick_now()
 	add_scaled(x, a, 1.0)

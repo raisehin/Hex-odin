@@ -181,13 +181,18 @@ q8_0_dot_q8 :: proc "contextless" (w: []u8, ws: []f32, q: []i8, d: []f32) -> f32
 	for ; b + 4 <= blocks; b += 4 {
 		w0 := wp + uintptr(b * Q8_0_BLOCK_SIZEOF)
 		q0 := qp + uintptr(b * Q8_0_QUANT_SIZEOF)
-		d0 := dp + uintptr(b * 4)
-		dw := qk_load4(rawptr(wsp + uintptr(b * 4))) * qk_load4(rawptr(d0))
-		dh := transmute([4]f32)dw
-		acc0 = simd.fma(qk_pf(w0, q0), simd.f32x8(dh[0]), acc0)
-		acc1 = simd.fma(qk_pf(w0 + 34, q0 + 32), simd.f32x8(dh[1]), acc1)
-		acc2 = simd.fma(qk_pf(w0 + 68, q0 + 64), simd.f32x8(dh[2]), acc2)
-		acc3 = simd.fma(qk_pf(w0 + 102, q0 + 96), simd.f32x8(dh[3]), acc3)
+		d0 := uintptr(b * 4)
+		// One scalar product per block, broadcast straight into the fma: the
+		// f32x4 form forced a vector store per group plus a store-forwarding
+		// stall on the dh[n] reload.
+		s0 := (cast(^f32)(wsp + d0))^ * (cast(^f32)(dp + d0))^
+		s1 := (cast(^f32)(wsp + d0 + 4))^ * (cast(^f32)(dp + d0 + 4))^
+		s2 := (cast(^f32)(wsp + d0 + 8))^ * (cast(^f32)(dp + d0 + 8))^
+		s3 := (cast(^f32)(wsp + d0 + 12))^ * (cast(^f32)(dp + d0 + 12))^
+		acc0 = simd.fma(qk_pf(w0, q0), simd.f32x8(s0), acc0)
+		acc1 = simd.fma(qk_pf(w0 + 34, q0 + 32), simd.f32x8(s1), acc1)
+		acc2 = simd.fma(qk_pf(w0 + 68, q0 + 64), simd.f32x8(s2), acc2)
+		acc3 = simd.fma(qk_pf(w0 + 102, q0 + 96), simd.f32x8(s3), acc3)
 	}
 	acc := (acc0 + acc1) + (acc2 + acc3)
 	for ; b < blocks; b += 1 {
@@ -229,21 +234,30 @@ q8_0_dot_q8_2f :: proc "contextless" (w: []u8, ws: []f32, qa: []i8, da: []f32, q
 		w0 := wp + uintptr(b * Q8_0_BLOCK_SIZEOF)
 		q0 := uintptr(b * Q8_0_QUANT_SIZEOF)
 		d0 := uintptr(b * 4)
-		sw := qk_load4(rawptr(wsp + d0))
-		sa := transmute([4]f32)(sw * qk_load4(rawptr(dap + d0)))
-		sb := transmute([4]f32)(sw * qk_load4(rawptr(dbp + d0)))
+		s0 := (cast(^f32)(wsp + d0))^
+		sa0 := s0 * (cast(^f32)(dap + d0))^
+		sb0 := s0 * (cast(^f32)(dbp + d0))^
+		s1 := (cast(^f32)(wsp + d0 + 4))^
+		sa1 := s1 * (cast(^f32)(dap + d0 + 4))^
+		sb1 := s1 * (cast(^f32)(dbp + d0 + 4))^
+		s2 := (cast(^f32)(wsp + d0 + 8))^
+		sa2 := s2 * (cast(^f32)(dap + d0 + 8))^
+		sb2 := s2 * (cast(^f32)(dbp + d0 + 8))^
+		s3 := (cast(^f32)(wsp + d0 + 12))^
+		sa3 := s3 * (cast(^f32)(dap + d0 + 12))^
+		sb3 := s3 * (cast(^f32)(dbp + d0 + 12))^
 		wv := qk_load_i8x32(rawptr(w0 + 2))
-		a0 = simd.fma(qk_pf_w(wv, qap + q0), simd.f32x8(sa[0]), a0)
-		b0 = simd.fma(qk_pf_w(wv, qbp + q0), simd.f32x8(sb[0]), b0)
+		a0 = simd.fma(qk_pf_w(wv, qap + q0), simd.f32x8(sa0), a0)
+		b0 = simd.fma(qk_pf_w(wv, qbp + q0), simd.f32x8(sb0), b0)
 		wv = qk_load_i8x32(rawptr(w0 + 34 + 2))
-		a1 = simd.fma(qk_pf_w(wv, qap + q0 + 32), simd.f32x8(sa[1]), a1)
-		b1 = simd.fma(qk_pf_w(wv, qbp + q0 + 32), simd.f32x8(sb[1]), b1)
+		a1 = simd.fma(qk_pf_w(wv, qap + q0 + 32), simd.f32x8(sa1), a1)
+		b1 = simd.fma(qk_pf_w(wv, qbp + q0 + 32), simd.f32x8(sb1), b1)
 		wv = qk_load_i8x32(rawptr(w0 + 68 + 2))
-		a2 = simd.fma(qk_pf_w(wv, qap + q0 + 64), simd.f32x8(sa[2]), a2)
-		b2 = simd.fma(qk_pf_w(wv, qbp + q0 + 64), simd.f32x8(sb[2]), b2)
+		a2 = simd.fma(qk_pf_w(wv, qap + q0 + 64), simd.f32x8(sa2), a2)
+		b2 = simd.fma(qk_pf_w(wv, qbp + q0 + 64), simd.f32x8(sb2), b2)
 		wv = qk_load_i8x32(rawptr(w0 + 102 + 2))
-		a3 = simd.fma(qk_pf_w(wv, qap + q0 + 96), simd.f32x8(sa[3]), a3)
-		b3 = simd.fma(qk_pf_w(wv, qbp + q0 + 96), simd.f32x8(sb[3]), b3)
+		a3 = simd.fma(qk_pf_w(wv, qap + q0 + 96), simd.f32x8(sa3), a3)
+		b3 = simd.fma(qk_pf_w(wv, qbp + q0 + 96), simd.f32x8(sb3), b3)
 	}
 	for ; b < blocks; b += 1 {
 		woff := wp + uintptr(b * Q8_0_BLOCK_SIZEOF)
@@ -256,6 +270,116 @@ q8_0_dot_q8_2f :: proc "contextless" (w: []u8, ws: []f32, qa: []i8, da: []f32, q
 	}
 	fa = simd.reduce_add_ordered((a0 + a1) + (a2 + a3))
 	fb = simd.reduce_add_ordered((b0 + b1) + (b2 + b3))
+	return
+}
+
+// qk_pf_w2 is qk_pf_w with the activation's sign already split out: xabs is
+// abs(x) and xv the raw activation. Two weight rows dotted against the same
+// frame share one xabs, one load and one abs.
+@(private, require_results, enable_target_feature = "avx2")
+qk_pf_w2 :: #force_inline proc "contextless" (wv, xv, xabs: simd.i8x32) -> simd.f32x8 {
+	return simd.f32x8(qk_pmaddwd(qk_pmaddubsw(xabs, qk_signmul(wv, xv)), simd.i16x16(1)))
+}
+
+// q8_0_dot_q8_2f_2r dots two adjacent weight rows against two adjacent
+// quantised frames: four dots per pass over the block bytes. The activation
+// block of a frame is loaded and abs'd once and then reused by both rows, which
+// takes the cost of a dot from ~10 vector uops to ~6.5.
+//
+// Each dot sums into two accumulators, one per block of a two-block step, and
+// the pair is reduced in that order, so the result is a fixed function of the
+// row and activation bytes. Both the serial and the pooled path call this
+// kernel through lin_rows_core, which keeps their outputs bit-identical.
+@(enable_target_feature = "avx2,fma")
+q8_0_dot_q8_2f_2r :: proc "contextless" (
+	wa: []u8, wsa: []f32,
+	wb: []u8, wsb: []f32,
+	q0: []i8, d0: []f32,
+	q1: []i8, d1: []f32,
+) -> (a0, b0, a1, b1: f32) {
+	blocks := len(q0) / Q8_0_QUANT_SIZEOF
+	wap := uintptr(raw_data(wa))
+	wbp := uintptr(raw_data(wb))
+	wsap := uintptr(raw_data(wsa))
+	wsbp := uintptr(raw_data(wsb))
+	q0p := uintptr(raw_data(q0))
+	q1p := uintptr(raw_data(q1))
+	d0p := uintptr(raw_data(d0))
+	d1p := uintptr(raw_data(d1))
+
+	aa0 := simd.f32x8(0) // row a, frame 0
+	aa1 := simd.f32x8(0)
+	ba0 := simd.f32x8(0) // row b, frame 0
+	ba1 := simd.f32x8(0)
+	ab0 := simd.f32x8(0) // row a, frame 1
+	ab1 := simd.f32x8(0)
+	bb0 := simd.f32x8(0) // row b, frame 1
+	bb1 := simd.f32x8(0)
+
+	b := 0
+	for ; b + 2 <= blocks; b += 2 {
+		wo := uintptr(b * Q8_0_BLOCK_SIZEOF)
+		qo := uintptr(b * Q8_0_QUANT_SIZEOF)
+		dof := uintptr(b * 4)
+		{
+			wva := qk_load_i8x32(rawptr(wap + wo + 2))
+			wvb := qk_load_i8x32(rawptr(wbp + wo + 2))
+			x0 := qk_load_i8x32(rawptr(q0p + qo))
+			x1 := qk_load_i8x32(rawptr(q1p + qo))
+			ax0 := simd.abs(x0)
+			ax1 := simd.abs(x1)
+			sa := (cast(^f32)(wsap + dof))^
+			sb := (cast(^f32)(wsbp + dof))^
+			da0 := (cast(^f32)(d0p + dof))^
+			db0 := (cast(^f32)(d1p + dof))^
+			aa0 = simd.fma(qk_pf_w2(wva, x0, ax0), simd.f32x8(sa * da0), aa0)
+			ba0 = simd.fma(qk_pf_w2(wvb, x0, ax0), simd.f32x8(sb * da0), ba0)
+			ab0 = simd.fma(qk_pf_w2(wva, x1, ax1), simd.f32x8(sa * db0), ab0)
+			bb0 = simd.fma(qk_pf_w2(wvb, x1, ax1), simd.f32x8(sb * db0), bb0)
+		}
+		{
+			wo := uintptr((b + 1) * Q8_0_BLOCK_SIZEOF)
+			qo := uintptr((b + 1) * Q8_0_QUANT_SIZEOF)
+			dof := uintptr((b + 1) * 4)
+			wva := qk_load_i8x32(rawptr(wap + wo + 2))
+			wvb := qk_load_i8x32(rawptr(wbp + wo + 2))
+			x0 := qk_load_i8x32(rawptr(q0p + qo))
+			x1 := qk_load_i8x32(rawptr(q1p + qo))
+			ax0 := simd.abs(x0)
+			ax1 := simd.abs(x1)
+			sa := (cast(^f32)(wsap + dof))^
+			sb := (cast(^f32)(wsbp + dof))^
+			da0 := (cast(^f32)(d0p + dof))^
+			db0 := (cast(^f32)(d1p + dof))^
+			aa1 = simd.fma(qk_pf_w2(wva, x0, ax0), simd.f32x8(sa * da0), aa1)
+			ba1 = simd.fma(qk_pf_w2(wvb, x0, ax0), simd.f32x8(sb * da0), ba1)
+			ab1 = simd.fma(qk_pf_w2(wva, x1, ax1), simd.f32x8(sa * db0), ab1)
+			bb1 = simd.fma(qk_pf_w2(wvb, x1, ax1), simd.f32x8(sb * db0), bb1)
+		}
+	}
+	for ; b < blocks; b += 1 {
+		wo := uintptr(b * Q8_0_BLOCK_SIZEOF)
+		qo := uintptr(b * Q8_0_QUANT_SIZEOF)
+		dof := uintptr(b * 4)
+		wva := qk_load_i8x32(rawptr(wap + wo + 2))
+		wvb := qk_load_i8x32(rawptr(wbp + wo + 2))
+		x0 := qk_load_i8x32(rawptr(q0p + qo))
+		x1 := qk_load_i8x32(rawptr(q1p + qo))
+		ax0 := simd.abs(x0)
+		ax1 := simd.abs(x1)
+		sa := (cast(^f32)(wsap + dof))^
+		sb := (cast(^f32)(wsbp + dof))^
+		da0 := (cast(^f32)(d0p + dof))^
+		db0 := (cast(^f32)(d1p + dof))^
+		aa0 = simd.fma(qk_pf_w2(wva, x0, ax0), simd.f32x8(sa * da0), aa0)
+		ba0 = simd.fma(qk_pf_w2(wvb, x0, ax0), simd.f32x8(sb * da0), ba0)
+		ab0 = simd.fma(qk_pf_w2(wva, x1, ax1), simd.f32x8(sa * db0), ab0)
+		bb0 = simd.fma(qk_pf_w2(wvb, x1, ax1), simd.f32x8(sb * db0), bb0)
+	}
+	a0 = simd.reduce_add_ordered(aa0 + aa1)
+	b0 = simd.reduce_add_ordered(ba0 + ba1)
+	a1 = simd.reduce_add_ordered(ab0 + ab1)
+	b1 = simd.reduce_add_ordered(bb0 + bb1)
 	return
 }
 

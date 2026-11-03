@@ -121,17 +121,81 @@ lin_act :: proc(out, x: []f32, w: Gguf_Tensor, bias: []f32, a: Act) {
 lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32) {
 	acts := act_make(x.rows, x.cols)
 	defer act_destroy(&acts)
-	blocks := act_blocks(x.cols)
 	if w.type == .Q8_0 { quantize_acts(acts, x) }
-	for r in 0 ..< x.rows {
-		xr := x.data[r * x.cols:][:x.cols]
-		lin_act(
-			out.data[r * out.cols:][:out.cols],
-			xr,
-			w,
-			bias,
-			Act{q = acts.q[r * x.cols:][:x.cols], d = acts.d[r * blocks:][:blocks]},
-		)
+	lin_rows_core(out, x, w, bias, acts, 0, out.cols)
+}
+
+// lin_rows_core computes output rows [lo, hi) for every frame. Q8_0 rows are
+// taken two at a time through the 2-row x 2-frame kernel, so one pass over the
+// weight bytes feeds four dots; the odd row and the odd frame fall back to the
+// 1-row kernels. Both the serial and the pooled entry points call this, so a
+// worker's rows are computed by exactly the code the serial path runs and the
+// two cannot drift.
+@(private = "file")
+lin_rows_core :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, acts: Act, lo, hi: int) {
+	rows := out.cols
+	frames := x.rows
+	blocks := act_blocks(x.cols)
+	row_bytes := len(w.bytes) / rows
+	o := lo
+	if w.type == .Q8_0 {
+		for ; o + 1 < hi; o += 2 {
+			ra := w.bytes[o * row_bytes:][:row_bytes]
+			rb := w.bytes[(o + 1) * row_bytes:][:row_bytes]
+			wsa := scales_row(w, o)
+			wsb := scales_row(w, (o + 1))
+			ba := bias == nil ? 0 : bias[o]
+			bb := bias == nil ? 0 : bias[(o + 1)]
+			has_bias := bias != nil
+			f := 0
+			for ; f + 1 < frames; f += 2 {
+				v00, v10, v01, v11 := q8_0_dot_q8_2f_2r(
+					ra, wsa, rb, wsb,
+					acts.q[f * x.cols:][:x.cols], acts.d[f * blocks:][:blocks],
+					acts.q[(f + 1) * x.cols:][:x.cols], acts.d[(f + 1) * blocks:][:blocks],
+				)
+				out.data[f * rows + o] = has_bias ? v00 + ba : v00
+				out.data[f * rows + o + 1] = has_bias ? v10 + bb : v10
+				out.data[(f + 1) * rows + o] = has_bias ? v01 + ba : v01
+				out.data[(f + 1) * rows + o + 1] = has_bias ? v11 + bb : v11
+			}
+			for ; f < frames; f += 1 {
+				a := Act {
+					q = acts.q[f * x.cols:][:x.cols],
+					d = acts.d[f * blocks:][:blocks],
+				}
+				xa := x.data[f * x.cols:][:x.cols]
+				va := weight_dot(ra, wsa, xa, w.type, a)
+				vb := weight_dot(rb, wsb, xa, w.type, a)
+				out.data[f * rows + o] = has_bias ? va + ba : va
+				out.data[f * rows + o + 1] = has_bias ? vb + bb : vb
+			}
+		}
+	}
+	for ; o < hi; o += 1 {
+		row := w.bytes[o * row_bytes:][:row_bytes]
+		ws := scales_row(w, o)
+		b := bias == nil ? 0 : bias[o]
+		f := 0
+		if w.type == .Q8_0 {
+			for ; f + 2 <= frames; f += 2 {
+				va, vb := q8_0_dot_q8_2f(
+					row, ws,
+					acts.q[f * x.cols:][:x.cols], acts.d[f * blocks:][:blocks],
+					acts.q[(f + 1) * x.cols:][:x.cols], acts.d[(f + 1) * blocks:][:blocks],
+				)
+				out.data[f * rows + o] = bias == nil ? va : va + b
+				out.data[(f + 1) * rows + o] = bias == nil ? vb : vb + b
+			}
+		}
+		for ; f < frames; f += 1 {
+			a := Act {
+				q = acts.q[f * x.cols:][:x.cols],
+				d = acts.d[f * blocks:][:blocks],
+			}
+			v := weight_dot(row, ws, x.data[f * x.cols:][:x.cols], w.type, a)
+			out.data[f * rows + o] = bias == nil ? v : v + b
+		}
 	}
 }
 
@@ -257,6 +321,10 @@ Lin_Task :: struct {
 	bias:   []f32,
 	a:      Act,
 	nt:     int,
+	// Output-row range this task owns. lin_rows_par covers the whole matrix;
+	// lin_rows_par_span covers a caller slice so a GPU+CPU split can share
+	// one quantisation.
+	lo, hi: int,
 }
 
 // lin_task owns an output-row range and runs every frame inside it, so a
@@ -265,39 +333,16 @@ Lin_Task :: struct {
 @(private = "file")
 lin_task :: proc(ctx: rawptr, wid: int) {
 	t := cast(^Lin_Task)ctx
-	rows := t.out.cols
-	per := (rows + t.nt - 1) / t.nt
-	lo := min(wid * per, rows)
-	hi := min(lo + per, rows)
-	row_bytes := len(t.w.bytes) / rows
-	blocks := act_blocks(t.x.cols)
-	pairs := t.w.type == .Q8_0 // the 2-frame kernel only exists for Q8_0
-	frames := t.x.rows
-	for o in lo ..< hi {
-		row := t.w.bytes[o * row_bytes:][:row_bytes]
-		b := t.bias == nil ? 0 : t.bias[o]
-		ws := scales_row(t.w, o)
-		f := 0
-		if pairs {
-			for ; f + 2 <= frames; f += 2 {
-				qa := t.a.q[f * t.x.cols:][:t.x.cols]
-				qb := t.a.q[(f + 1) * t.x.cols:][:t.x.cols]
-				da := t.a.d[f * blocks:][:blocks]
-				db := t.a.d[(f + 1) * blocks:][:blocks]
-				va, vb := q8_0_dot_q8_2f(row, ws, qa, da, qb, db)
-				t.out.data[f * t.out.cols + o] = t.bias == nil ? va : va + b
-				t.out.data[(f + 1) * t.out.cols + o] = t.bias == nil ? vb : vb + b
-			}
-		}
-		for ; f < frames; f += 1 {
-			a := Act {
-				q = t.a.q[f * t.x.cols:][:t.x.cols],
-				d = t.a.d[f * blocks:][:blocks],
-			}
-			v := weight_dot(row, ws, t.x.data[f * t.x.cols:][:t.x.cols], t.w.type, a)
-			t.out.data[f * t.out.cols + o] = t.bias == nil ? v : v + b
-		}
-	}
+	// Rows are paired inside lin_rows_core, so every worker must start on an
+	// even row: a split that begins mid-pair would run the 1-row kernel on a
+	// row the serial path pairs, and the two summation trees differ in the
+	// last bits. Rounding the stride up to 2 costs at most one row of work.
+	// Callers must pass an even lo; mid-splits in the GPU path round down.
+	per := (t.hi - t.lo + t.nt - 1) / t.nt
+	if per % 2 != 0 { per += 1 }
+	lo := min(t.lo + wid * per, t.hi)
+	hi := min(lo + per, t.hi)
+	if lo < hi { lin_rows_core(t.out, t.x, t.w, t.bias, t.a, lo, hi) }
 }
 
 // lin_rows_par spreads the output rows of one linear over the worker pool.
@@ -310,7 +355,20 @@ lin_rows_par :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, pool: ^Pool, work
 	acts := act_make(x.rows, x.cols)
 	defer act_destroy(&acts)
 	if w.type == .Q8_0 { quantize_acts(acts, x) }
-	task := Lin_Task{out = out, x = x, w = w, bias = bias, a = acts, nt = nt}
+	task := Lin_Task{out = out, x = x, w = w, bias = bias, a = acts, nt = nt, lo = 0, hi = out.cols}
+	pool_run(pool, lin_task, &task)
+}
+
+// lin_rows_par_span is lin_rows_par for output rows [lo, hi) with caller-owned
+// activations, so a GPU+CPU row-split shares one quantisation. lo must be
+// even (see lin_task); hi may be anything.
+lin_rows_par_span :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, acts: Act, pool: ^Pool, workers, lo, hi: int) {
+	nt := pool == nil ? 1 : min(workers, max(hi - lo, 0))
+	if nt < 2 {
+		lin_rows_core(out, x, w, bias, acts, lo, hi)
+		return
+	}
+	task := Lin_Task{out = out, x = x, w = w, bias = bias, a = acts, nt = nt, lo = lo, hi = hi}
 	pool_run(pool, lin_task, &task)
 }
 

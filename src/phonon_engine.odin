@@ -61,6 +61,11 @@ phonon_open :: proc(path: string, threads: int) -> (ok: bool, err: string) {
 	e, open_err := phonon.engine_open(path, threads)
 	if open_err != "" { return false, fmt.aprintf("phonon engine: %s", open_err) }
 	ph = e
+	if gpu_ok, gpu_err := phonon.engine_gpu_status(&ph); gpu_err != "" {
+		log_write("[hex] phonon: GPU encoder disabled: %s", gpu_err)
+	} else if gpu_ok {
+		log_write("[hex] phonon: GPU encoder enabled (HEX_GPU)")
+	}
 	ph_live = true
 	return true, ""
 }
