@@ -129,7 +129,7 @@ gpu_lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, ge: ^Gpu_Enc, poo
 
 	acts := act_make(t, k, context.temp_allocator)
 	defer act_destroy(&acts, context.temp_allocator)
-	quantize_acts(acts, x)
+	quantize_acts_par(acts, x, pool, workers)
 	if err := d3d12.scratch_write_acts(sc, mem.slice_data_cast([]u8, acts.q), mem.slice_data_cast([]u8, acts.d)); err != "" {
 		ge.err = err
 		ge.ok = false
@@ -150,6 +150,104 @@ gpu_lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, ge: ^Gpu_Enc, poo
 		ge.ok = false
 		lin_rows_par_span(out, x, w, bias, acts, pool, workers, 0, mid)
 		return true
+	}
+	return true
+}
+
+// gpu_qkv_rows runs the three attention projections, which share the same
+// input x, as one quantisation + one activation upload followed by three
+// sequential row-splits over the shared scratch. Saves 2x quantize_acts +
+// 2x scratch_write_acts per block vs three gpu_lin_rows calls; the launches
+// and joins stay sequential because the three outputs share one out/readback
+// pair (each finish consumes it before the next launch overwrites it).
+// True means all three outs are filled (GPU split or CPU fallback inside);
+// false means nothing was done and the caller must run the CPU kernels.
+gpu_qkv_rows :: proc(e: ^Encoder, q, k, v, x: Mat, wq, wk, wv: Gguf_Tensor) -> bool {
+	ge := e.gpu
+	pool := e.pool
+	workers := e.workers
+	if ge == nil || !ge.ok { return false }
+	if wq.type != .Q8_0 || wk.type != .Q8_0 || wv.type != .Q8_0 { return false }
+	n := int(wq.dims[1])
+	kk := int(wq.dims[0])
+	t := x.rows
+	if n <= 0 || kk <= 0 || t <= 0 { return false }
+	if int(wk.dims[1]) != n || int(wv.dims[1]) != n { return false }
+	if int(wk.dims[0]) != kk || int(wv.dims[0]) != kk { return false }
+	if kk % 32 != 0 || kk > d3d12.MAX_K { return false }
+	if x.cols != kk { return false }
+	outs := [3]Mat{q, k, v}
+	ws := [3]Gguf_Tensor{wq, wk, wv}
+	for i in 0 ..< 3 {
+		if outs[i].rows != t || outs[i].cols != n { return false }
+		if len(outs[i].data) != t * n { return false }
+		if len(ws[i].bytes) != n * (kk / 32) * 34 { return false }
+	}
+
+	// Even split point, same gate as gpu_lin_rows: the CPU half of every
+	// projection must stay bit-identical with the serial path.
+	mid := (n / 2) / 2 * 2
+	if mid < 2 || t*n*kk < SPLIT_MIN_MAC { return false }
+
+	wws := [3]^d3d12.Weights{}
+	for i in 0 ..< 3 {
+		ww, found := ge.weights[ws[i].name]
+		if !found {
+			nw, err := d3d12.weights_upload(ge.dev, n, kk, ws[i].bytes, false)
+			if err != "" {
+				ge.err = fmt.tprintf("gpu weights %s: %s", ws[i].name, err)
+				ge.ok = false
+				return false
+			}
+			ge.weights[ws[i].name] = nw
+			ww = nw
+		}
+		if ww.n != n || ww.k != kk || ww.has_bias { return false }
+		wws[i] = ww
+	}
+
+	key := [3]int{mid, kk, t}
+	sc, sok := ge.scratch[key]
+	if !sok {
+		ns, err := d3d12.scratch_create(ge.dev, mid, kk, t)
+		if err != "" {
+			ge.err = err
+			ge.ok = false
+			return false
+		}
+		ge.scratch[key] = ns
+		sc = ns
+	}
+
+	// One quantisation of the shared input, one upload; all three GEMMs read
+	// the same act_q/act_d pair.
+	acts := act_make(t, kk, context.temp_allocator)
+	defer act_destroy(&acts, context.temp_allocator)
+	quantize_acts_par(acts, x, pool, workers)
+	if err := d3d12.scratch_write_acts(sc, mem.slice_data_cast([]u8, acts.q), mem.slice_data_cast([]u8, acts.d)); err != "" {
+		ge.err = err
+		ge.ok = false
+		for i in 0 ..< 3 { lin_rows_par(outs[i], x, ws[i], nil, pool, workers) }
+		return true
+	}
+	for i in 0 ..< 3 {
+		if err := d3d12.gemm_launch(ge.dev, wws[i], sc, mid); err != "" {
+			// Launch failed before the GPU did anything: this linear and the
+			// rest run on the CPU. Earlier outs are already filled.
+			ge.err = fmt.tprintf("gpu exec %s: %s", ws[i].name, err)
+			ge.ok = false
+			for j in i ..< 3 { lin_rows_par(outs[j], x, ws[j], nil, pool, workers) }
+			return true
+		}
+		// The pool owns rows [mid, n) while the GPU owns [0, mid).
+		lin_rows_par_span(outs[i], x, ws[i], nil, acts, pool, workers, mid, n)
+		if err := d3d12.gemm_finish_strided(ge.dev, sc, outs[i].data, n); err != "" {
+			ge.err = fmt.tprintf("gpu exec %s: %s", ws[i].name, err)
+			ge.ok = false
+			lin_rows_par_span(outs[i], x, ws[i], nil, acts, pool, workers, 0, mid)
+			for j in i + 1 ..< 3 { lin_rows_par(outs[j], x, ws[j], nil, pool, workers) }
+			return true
+		}
 	}
 	return true
 }

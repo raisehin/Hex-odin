@@ -315,6 +315,42 @@ par_chunks :: proc(p: ^Pool, workers, n: int, fn: Chunk_Proc, data: rawptr) {
 
 // --- linear layers ---------------------------------------------------------
 
+// Quant_Task is the shared context for one parallel quantize_acts dispatch.
+@(private = "file")
+Quant_Task :: struct {
+	a: Act,
+	x: Mat,
+}
+
+// quant_chunk quantises frames [lo, hi): each frame is independent, so the
+// pooled bytes are identical to the serial quantize_acts.
+@(private = "file")
+quant_chunk :: proc(data: rawptr, lo, hi: int) {
+	t := cast(^Quant_Task)data
+	cols := t.x.cols
+	blocks := act_blocks(cols)
+	for f in lo ..< hi {
+		quantize_row_q8_0(
+			t.x.data[f * cols:][:cols],
+			t.a.q[f * cols:][:cols],
+			t.a.d[f * blocks:][:blocks],
+		)
+	}
+}
+
+// quantize_acts_par is quantize_acts spread over the pool. Byte-identical by
+// construction (per-frame deterministic, disjoint outputs). Below ~32 frames
+// the pool dispatch costs more than the quant, so small shapes stay serial -
+// this keeps the short-clip path exactly as it was.
+quantize_acts_par :: proc(a: Act, x: Mat, pool: ^Pool, workers: int) {
+	if x.rows < 32 || pool == nil || workers < 2 {
+		quantize_acts(a, x)
+		return
+	}
+	ctx := Quant_Task{a = a, x = x}
+	par_chunks(pool, workers, x.rows, quant_chunk, &ctx)
+}
+
 Lin_Task :: struct {
 	out, x: Mat,
 	w:      Gguf_Tensor,
@@ -354,7 +390,7 @@ lin_rows_par :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, pool: ^Pool, work
 	}
 	acts := act_make(x.rows, x.cols)
 	defer act_destroy(&acts)
-	if w.type == .Q8_0 { quantize_acts(acts, x) }
+	if w.type == .Q8_0 { quantize_acts_par(acts, x, pool, workers) }
 	task := Lin_Task{out = out, x = x, w = w, bias = bias, a = acts, nt = nt, lo = 0, hi = out.cols}
 	pool_run(pool, lin_task, &task)
 }

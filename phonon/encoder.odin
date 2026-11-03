@@ -441,9 +441,11 @@ attention :: proc(e: ^Encoder, layer: int, x: Mat, out: Mat) {
 
 	t0 := time.tick_now()
 	q, k, v, p := e.ws.q, e.ws.k, e.ws.v, e.ws.p
-	enc_lin_rows(e, q, x, bw.attn_q, nil)
-	enc_lin_rows(e, k, x, bw.attn_k, nil)
-	enc_lin_rows(e, v, x, bw.attn_v, nil)
+	if !gpu_qkv_rows(e, q, k, v, x, bw.attn_q, bw.attn_k, bw.attn_v) {
+		enc_lin_rows(e, q, x, bw.attn_q, nil)
+		enc_lin_rows(e, k, x, bw.attn_k, nil)
+		enc_lin_rows(e, v, x, bw.attn_v, nil)
+	}
 
 	enc_lin_rows(e, p, e.ws.pe, bw.attn_pos, nil)
 

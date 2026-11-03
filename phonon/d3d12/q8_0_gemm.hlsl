@@ -50,6 +50,10 @@ void main(uint3 gid : SV_GroupID, uint3 tid3 : SV_GroupThreadID)
         return;
 
     uint f0 = gid.y * FRAMES_PER_WARP;
+    // Fully out-of-range groups write nothing (stores below are predicated
+    // on f0+f<T with use=0 zeroing every accumulation), so skip all traffic.
+    if (f0 >= T)
+        return;
 
     float facc[FRAMES_PER_WARP];
     [unroll]
