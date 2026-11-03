@@ -483,9 +483,13 @@ conv_first_chunk :: proc(data: rawptr, lo, hi: int) #no_bounds_check {
 				qk_store8(rawptr(dst + uintptr(j * 4)), acc + simd.f32x8(b))
 			}
 			for ; j < n; j += 1 {
-				s := b
+				// Bias LAST, matching the 8-wide body above (acc + b). See the
+				// note in conv_1x1_chunk: seeding with the bias would make this
+				// position's rounding depend on the chunk boundary and hence on
+				// the thread count.
+				s: f32 = 0
 				for t in 0 ..< taps { s += wrow[t] * xm[t * TILE + j] }
-				c.out[oc * c.pos + t0 + j] = s
+				c.out[oc * c.pos + t0 + j] = s + b
 			}
 		}
 	}
@@ -557,9 +561,16 @@ conv_1x1_chunk :: proc(data: rawptr, lo, hi: int) #no_bounds_check {
 			for o in 0 ..< c.ocs {
 				row := c.w[o * ics:][:ics]
 				for j in 0 ..< n {
-					s := c.bias[o]
+					// Bias LAST, matching the 8-wide body below. Seeding the
+					// accumulator with the bias instead would push it through
+					// every intermediate rounding, so a position landing in this
+					// tail would differ in its last bits from the same position
+					// handled by the body. Which positions land here depends on
+					// per = ceil(pos/nt), which made the output a function of the
+					// thread count.
+					s: f32 = 0
 					for i in 0 ..< ics { s += row[i] * c.x[i * c.pos + p0 + j] }
-					c.out[o * c.pos + p0 + j] = s
+					c.out[o * c.pos + p0 + j] = s + c.bias[o]
 				}
 			}
 			continue
