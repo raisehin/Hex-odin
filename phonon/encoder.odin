@@ -304,6 +304,13 @@ Encoder :: struct {
 		// depthwise pass reads a window of the GLU output per channel, so it
 		// must never write where it still reads
 		scores: []f32, // [n_heads][T][T]
+		// dd-major copies of k and p: [d][T] and [d][2T-1]. The score phase
+		// walks dd (the reduction axis) in the outer loop, so laying the
+		// independent j axis out contiguously turns eight scalar loads per
+		// MAC into one vector load per eight MACs without touching the
+		// summation order of any individual output.
+		kt: []f32,
+		pt: []f32,
 	},
 }
 
@@ -339,6 +346,14 @@ encoder_resize :: proc(e: ^Encoder, T: int) {
 	mat_destroy(&e.ws.c, alloc)
 	mat_destroy(&e.ws.dw, alloc)
 	delete(e.ws.scores, alloc)
+	delete(e.ws.kt, alloc)
+	delete(e.ws.pt, alloc)
+	e.ws.kt = nil
+	e.ws.pt = nil
+	if T > 0 {
+		e.ws.kt = make([]f32, d*T, alloc)
+		e.ws.pt = make([]f32, d*(2*T-1), alloc)
+	}
 	e.ws.a = mat_make(T, d, alloc)
 	e.ws.b = mat_make(T, d, alloc)
 	e.ws.ff = mat_make(T, e.cfg.d_ff, alloc)
@@ -373,6 +388,8 @@ encoder_destroy :: proc(e: ^Encoder) {
 	mat_destroy(&e.ws.c, alloc)
 	mat_destroy(&e.ws.dw, alloc)
 	delete(e.ws.scores, alloc)
+	delete(e.ws.kt, alloc)
+	delete(e.ws.pt, alloc)
 	delete(e.bw, alloc)
 	e^ = {}
 }
@@ -457,8 +474,11 @@ attention :: proc(e: ^Encoder, layer: int, x: Mat, out: Mat) {
 
 	bu := bw.pos_bias_u
 	bv := bw.pos_bias_v
+	build_dd_major(e.ws.kt, e.ws.pt, k, p, T, d)
 	st := Score_Task {
-		q = q, k = k, p = p, scores = e.ws.scores,
+		kt = e.ws.kt, pt = e.ws.pt,
+		scores = e.ws.scores,
+		q = q,
 		bu = bu, bv = bv,
 		H = H, T = T, hd = hd,
 		scale = f32(1) / math.sqrt(f32(hd)),
@@ -482,11 +502,59 @@ attention :: proc(e: ^Encoder, layer: int, x: Mat, out: Mat) {
 
 @(private = "file")
 Score_Task :: struct {
-	q, k, p:  Mat,
+	kt, pt:   []f32, // [d][T] and [d][2T-1], dd-major
 	scores:   []f32,
+	q:        Mat,
 	bu, bv:   []f32,
-	H, T, hd:        int,
-	scale:           f32,
+	H, T, hd: int,
+	scale:    f32,
+}
+
+// build_dd_major transposes k[T][d] -> kt[d][T] and p[2T-1][d] -> pt[d][2T-1].
+// The score inner loop walks dd in the outer position, so making the
+// independent j axis contiguous is what lets eight outputs share one load.
+// Tiled 8x8 so both the gather and the scatter stay cache-friendly; the cost
+// is ~1.6 MB of copies per block against a phase that reads far more.
+@(private = "file")
+build_dd_major :: proc(kt, pt: []f32, k, p: Mat, T, d: int) {
+	TILE :: 8
+	np := 2*T - 1
+	// k: [T][d] -> [d][T]
+	c := 0
+	for ; c + TILE <= d; c += TILE {
+		j := 0
+		for ; j + TILE <= T; j += TILE {
+			for cc in 0 ..< TILE {
+				kd := k.data[(j*d + c + cc):]
+				ktd := kt[(c+cc)*T + j:]
+				for jj in 0 ..< TILE { ktd[jj] = kd[jj*d] }
+			}
+		}
+		for ; j < T; j += 1 {
+			for cc in 0 ..< TILE { kt[(c+cc)*T + j] = k.data[j*d + c + cc] }
+		}
+	}
+	for ; c < d; c += 1 {
+		for j in 0 ..< T { kt[c*T + j] = k.data[j*d + c] }
+	}
+	// p: [2T-1][d] -> [d][2T-1]
+	c = 0
+	for ; c + TILE <= d; c += TILE {
+		j := 0
+		for ; j + TILE <= np; j += TILE {
+			for cc in 0 ..< TILE {
+				pd := p.data[(j*d + c + cc):]
+				ptd := pt[(c+cc)*np + j:]
+				for jj in 0 ..< TILE { ptd[jj] = pd[jj*d] }
+			}
+		}
+		for ; j < np; j += 1 {
+			for cc in 0 ..< TILE { pt[(c+cc)*np + j] = p.data[j*d + c + cc] }
+		}
+	}
+	for ; c < d; c += 1 {
+		for j in 0 ..< np { pt[c*np + j] = p.data[j*d + c] }
+	}
 }
 
 @(private = "file")
@@ -494,46 +562,94 @@ score_rows :: proc(ctx: rawptr, lo, hi: int) #no_bounds_check {
 	t := cast(^Score_Task)ctx
 	H, T, hd := t.H, t.T, t.hd
 	tt := T * T
-	// qi+bu and qi+bv do not depend on j, yet the j loop recomputed them for
-	// every j: the same two adds, once per (h,i) instead of once per (h,i,j).
-	// Same operands, same single add -> bit-identical.
-	Aq_Scratch :: [512]f32
-	aq_buf: Aq_Scratch
-	bq_buf: Aq_Scratch
+	np := 2*T - 1
+
+	// Four query rows share one pass over the weight side: the pt windows of
+	// consecutive i overlap by all but one element, so blocking i is what
+	// turns the O(T^2) traffic term into O(T^2/4). Eight j per step ride one
+	// vector and keep their own dd-ascending chain, so no output's summation
+	// order moves.
+	IB :: 4
+	JB :: 8
+
+	// aplane/bplane: qi+bu and qi+bv, per blocked query row.
+	Plane :: [2048]f32
 	aplane: []f32
 	bplane: []f32
-	if hd <= len(aq_buf) {
-		aplane = aq_buf[:hd]
-		bplane = bq_buf[:hd]
+	Plane_Buf :: struct { a, b: Plane }
+	pb: Plane_Buf
+	if IB*hd <= len(Plane) {
+		aplane = pb.a[:IB*hd]
+		bplane = pb.b[:IB*hd]
 	} else {
-		aplane = make([]f32, hd, context.temp_allocator)
-		bplane = make([]f32, hd, context.temp_allocator)
+		aplane = make([]f32, IB*hd, context.temp_allocator)
+		bplane = make([]f32, IB*hd, context.temp_allocator)
 		defer {
 			delete(aplane, context.temp_allocator)
 			delete(bplane, context.temp_allocator)
 		}
 	}
-	for r in lo ..< hi {
+
+	r := lo
+	for r < hi {
 		h := r / T
-		i := r % T
+		i0 := r % T
 		off := h * hd
-		qi := mat_row(t.q, i)[off:][:hd]
-		row := t.scores[h * tt + i * T:][:T]
-		for dd in 0 ..< hd {
-			aplane[dd] = qi[dd] + t.bu[off + dd]
-			bplane[dd] = qi[dd] + t.bv[off + dd]
+		n := min(IB, hi - r)
+		n = min(n, T - i0)
+
+		for ii in 0 ..< n {
+			qi := mat_row(t.q, i0 + ii)[off:][:hd]
+			for dd in 0 ..< hd {
+				aplane[ii*hd + dd] = qi[dd] + t.bu[off + dd]
+				bplane[ii*hd + dd] = qi[dd] + t.bv[off + dd]
+			}
 		}
-		for j in 0 ..< T {
-			kj := mat_row(t.k, j)[off:][:hd]
-			ac: f32 = 0
-			for dd in 0 ..< hd { ac += aplane[dd] * kj[dd] }
-			// position term for index (j + T - 1 - i)
-			pj := mat_row(t.p, j + T - 1 - i)[off:][:hd]
-			bd: f32 = 0
-			for dd in 0 ..< hd { bd += bplane[dd] * pj[dd] }
-			row[j] = t.scale * (ac + bd)
+
+		jb := 0
+		for ; jb + JB <= T; jb += JB {
+			acc: [IB][JB]f32
+			bcc: [IB][JB]f32
+			for ii in 0 ..< IB {
+				for v in 0 ..< JB {
+					acc[ii][v] = 0
+					bcc[ii][v] = 0
+				}
+			}
+			for dd in 0 ..< hd {
+				kv := t.kt[(off+dd)*T + jb:][:JB]
+				pbase := (off+dd)*np + jb + T - 1 - i0
+				for ii in 0 ..< n {
+					a := aplane[ii*hd + dd]
+					b := bplane[ii*hd + dd]
+					pv := t.pt[pbase - ii:][:JB]
+					for v in 0 ..< JB {
+						acc[ii][v] += a * kv[v]
+						bcc[ii][v] += b * pv[v]
+					}
+				}
+			}
+			for ii in 0 ..< n {
+				row := t.scores[h*tt + (i0+ii)*T:][:T]
+				for v in 0 ..< JB { row[jb+v] = t.scale * (acc[ii][v] + bcc[ii][v]) }
+			}
 		}
-		softmax(row)
+		for ; jb < T; jb += 1 {
+			for ii in 0 ..< n {
+				row := t.scores[h*tt + (i0+ii)*T:][:T]
+				ac: f32 = 0
+				bd: f32 = 0
+				for dd in 0 ..< hd {
+					ac += aplane[ii*hd + dd] * t.kt[(off+dd)*T + jb]
+					bd += bplane[ii*hd + dd] * t.pt[(off+dd)*np + jb + T - 1 - (i0 + ii)]
+				}
+				row[jb] = t.scale * (ac + bd)
+			}
+		}
+		for ii in 0 ..< n {
+			softmax(t.scores[h*tt + (i0+ii)*T:][:T])
+		}
+		r += n
 	}
 }
 
