@@ -339,63 +339,6 @@ dispatch_finish :: proc(g: ^Gpu, readback: ^Buffer, dst: []u8) -> string {
 	return buffer_read(readback, dst)
 }
 
-// Dispatch_Entry is one dispatch inside a batched submission: same shader and
-// root layout, its own constants/SRVs and its own output region.
-Dispatch_Entry :: struct {
-	groups:    [3]u32,
-	constants: [ROOT_CONSTANT_COUNT]u32,
-	srvs:      [ROOT_SRV_COUNT]^Buffer,
-}
-
-// dispatch_launch_batch records n dispatches into ONE command list and submits
-// them with a single ExecuteCommandLists and a single fence signal. Dispatches
-// i writes into `uav` at i*slot_bytes and is copied to `readback` at the same
-// offset. One resource means one COMMON->UAV / UAV->COPY_SOURCE transition
-// pair for the whole batch instead of two barriers per dispatch.
-//
-// Numerically identical to n separate dispatch_launch calls: same shader, same
-// constants, same row ranges, same accumulation order. Only the submission
-// plumbing is shared.
-dispatch_launch_batch :: proc(
-	g: ^Gpu,
-	entries: []Dispatch_Entry,
-	uav: ^Buffer,
-	uav_before: d3d12.RESOURCE_STATES,
-	readback: ^Buffer,
-	slot_bytes: u64,
-) -> string {
-	if len(entries) == 0 { return "dispatch_launch_batch: no entries" }
-	if hr := g.alloc->Reset(); !hr_ok(hr) { return fmt.tprintf("alloc Reset: %v", hresult_msg(hr)) }
-	if hr := g.list->Reset(g.alloc, g.pso); !hr_ok(hr) { return fmt.tprintf("list Reset: %v", hresult_msg(hr)) }
-
-	base := uav.res->GetGPUVirtualAddress()
-	transition(g.list, uav.res, uav_before, STATE_UNORDERED_ACCESS)
-	g.list->SetComputeRootSignature(g.root_sig)
-	g.list->SetPipelineState(g.pso)
-	for e, i in entries {
-		c := e.constants
-		g.list->SetComputeRoot32BitConstants(ROOT_CONSTANTS_INDEX, ROOT_CONSTANT_COUNT, &c, 0)
-		for b, j in e.srvs {
-			if b != nil {
-				g.list->SetComputeRootShaderResourceView(u32(ROOT_WEIGHTS_Q_INDEX + j), b.res->GetGPUVirtualAddress())
-			}
-		}
-		g.list->SetComputeRootUnorderedAccessView(ROOT_OUT_INDEX, base + u64(i) * slot_bytes)
-		g.list->Dispatch(e.groups[0], e.groups[1], e.groups[2])
-	}
-
-	transition(g.list, uav.res, STATE_UNORDERED_ACCESS, STATE_COPY_SOURCE)
-	for _, i in entries {
-		g.list->CopyBufferRegion(readback.res, u64(i) * slot_bytes, uav.res, u64(i) * slot_bytes, slot_bytes)
-	}
-
-	if hr := g.list->Close(); !hr_ok(hr) { return fmt.tprintf("list Close: %v", hresult_msg(hr)) }
-
-	list := cast(^d3d12.ICommandList)g.list
-	g.queue->ExecuteCommandLists(1, &list)
-	return gpu_flush(g)
-}
-
 // dispatch_and_read runs one compute dispatch with this package's root layout,
 // then copies `out_bytes` from `dst` into `readback` and returns its bytes.
 dispatch_and_read :: proc(

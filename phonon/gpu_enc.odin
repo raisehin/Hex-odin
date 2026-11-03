@@ -17,27 +17,7 @@ package phonon
 import "core:fmt"
 import "core:mem"
 import "core:os"
-import "core:time"
 import d3d12 "./d3d12"
-
-// GPU_ROW_PCT is the percentage of output rows handed to the GPU. It is not
-// 50: measuring the split internals (stats.gpu_span vs stats.gpu_join) shows
-// the CPU half finishes about 30% sooner than the GPU per row, so an even
-// split leaves the GPU as the straggler and the join waits on it. Giving the
-// GPU fewer rows balances the two halves. Must stay even-aligned.
-GPU_ROW_PCT :: 50
-
-// split_mid returns the GPU-owned row count for n output rows, even so the
-// CPU half starts on a pair boundary.
-split_mid :: proc(n: int) -> int {
-	return (n * GPU_ROW_PCT / 100) / 2 * 2
-}
-
-// gms is the local millisecond helper (encoder.odin's ms_since is file-private).
-@(private = "file")
-gms :: proc(t: time.Tick) -> f64 {
-	return time.duration_milliseconds(time.tick_since(t))
-}
 
 Gpu_Enc :: struct {
 	dev:     ^d3d12.Gpu,
@@ -94,7 +74,7 @@ SPLIT_MIN_MAC :: 80_000_000
 // caller must run the CPU kernels. A GPU failure mid-flight fills the missing
 // rows on the CPU and poisons the sidecar, so the rest of the utterance stays
 // on the CPU path.
-gpu_lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, ge: ^Gpu_Enc, pool: ^Pool, workers: int, st: ^Encode_Stats = nil) -> bool {
+gpu_lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, ge: ^Gpu_Enc, pool: ^Pool, workers: int) -> bool {
 	if ge == nil || !ge.ok { return false }
 	if w.type != .Q8_0 { return false }
 	n := int(w.dims[1])
@@ -131,7 +111,7 @@ gpu_lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, ge: ^Gpu_Enc, poo
 
 	// Even split point: lin_rows_core pairs rows, so every range must start
 	// on an even row to stay bit-identical with the serial path.
-	mid := split_mid(n)
+	mid := (n / 2) / 2 * 2
 	if mid < 2 || t*n*k < SPLIT_MIN_MAC { return false }
 
 	key := [3]int{mid, k, t}
@@ -150,13 +130,11 @@ gpu_lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, ge: ^Gpu_Enc, poo
 	acts := act_make(t, k, context.temp_allocator)
 	defer act_destroy(&acts, context.temp_allocator)
 	quantize_acts_par(acts, x, pool, workers)
-	_tup := time.tick_now()
 	if err := d3d12.scratch_write_acts(sc, mem.slice_data_cast([]u8, acts.q), mem.slice_data_cast([]u8, acts.d)); err != "" {
 		ge.err = err
 		ge.ok = false
 		return false
 	}
-	if st != nil { st.gpu_up += gms(_tup) }
 	if err := d3d12.gemm_launch(ge.dev, ww, sc, mid); err != "" {
 		// Launch failed before the GPU did anything: whole linear on CPU.
 		ge.err = fmt.tprintf("gpu exec %s: %s", w.name, err)
@@ -165,10 +143,7 @@ gpu_lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, ge: ^Gpu_Enc, poo
 		return true
 	}
 	// The pool owns rows [mid, n) while the GPU owns [0, mid).
-	_ts := time.tick_now()
 	lin_rows_par_span(out, x, w, bias, acts, pool, workers, mid, n)
-	if st != nil { st.gpu_span += gms(_ts) }
-	_tj := time.tick_now()
 	if err := d3d12.gemm_finish_strided(ge.dev, sc, out.data, n); err != "" {
 		// GPU failed after the CPU half finished: fill its rows on the CPU.
 		ge.err = fmt.tprintf("gpu exec %s: %s", w.name, err)
@@ -176,7 +151,6 @@ gpu_lin_rows :: proc(out, x: Mat, w: Gguf_Tensor, bias: []f32, ge: ^Gpu_Enc, poo
 		lin_rows_par_span(out, x, w, bias, acts, pool, workers, 0, mid)
 		return true
 	}
-	if st != nil { st.gpu_join += gms(_tj) }
 	return true
 }
 
@@ -210,9 +184,9 @@ gpu_qkv_rows :: proc(e: ^Encoder, q, k, v, x: Mat, wq, wk, wv: Gguf_Tensor) -> b
 		if len(ws[i].bytes) != n * (kk / 32) * 34 { return false }
 	}
 
-	// Even split point, same gate and ratio as gpu_lin_rows: the CPU half of
-	// every projection must stay bit-identical with the serial path.
-	mid := split_mid(n)
+	// Even split point, same gate as gpu_lin_rows: the CPU half of every
+	// projection must stay bit-identical with the serial path.
+	mid := (n / 2) / 2 * 2
 	if mid < 2 || t*n*kk < SPLIT_MIN_MAC { return false }
 
 	wws := [3]^d3d12.Weights{}
@@ -244,47 +218,30 @@ gpu_qkv_rows :: proc(e: ^Encoder, q, k, v, x: Mat, wq, wk, wv: Gguf_Tensor) -> b
 		ge.scratch[key] = ns
 		sc = ns
 	}
-	if err := d3d12.scratch_ensure_slots(sc, 3); err != "" {
-		ge.err = err
-		ge.ok = false
-		return false
-	}
 
 	// One quantisation of the shared input, one upload; all three GEMMs read
 	// the same act_q/act_d pair.
 	acts := act_make(t, kk, context.temp_allocator)
 	defer act_destroy(&acts, context.temp_allocator)
 	quantize_acts_par(acts, x, pool, workers)
-	_tup := time.tick_now()
 	if err := d3d12.scratch_write_acts(sc, mem.slice_data_cast([]u8, acts.q), mem.slice_data_cast([]u8, acts.d)); err != "" {
 		ge.err = err
 		ge.ok = false
 		for i in 0 ..< 3 { lin_rows_par(outs[i], x, ws[i], nil, pool, workers) }
 		return true
 	}
-	if e.stats != nil { e.stats.gpu_up += gms(_tup) }
-
-	// One submission, one fence: all three projections are recorded into a
-	// single command list and land in separate output slots. The three CPU
-	// halves then run back-to-back and a single join covers all of them,
-	// instead of launch/span/join three times.
-	if err := d3d12.gemm_launch_batch3(ge.dev, wws, sc, mid); err != "" {
-		// Nothing reached the GPU: whole trio on the CPU.
-		ge.err = fmt.tprintf("gpu qkv batch: %s", err)
-		ge.ok = false
-		for i in 0 ..< 3 { lin_rows_par(outs[i], x, ws[i], nil, pool, workers) }
-		return true
-	}
-	_ts := time.tick_now()
 	for i in 0 ..< 3 {
+		if err := d3d12.gemm_launch(ge.dev, wws[i], sc, mid); err != "" {
+			// Launch failed before the GPU did anything: this linear and the
+			// rest run on the CPU. Earlier outs are already filled.
+			ge.err = fmt.tprintf("gpu exec %s: %s", ws[i].name, err)
+			ge.ok = false
+			for j in i ..< 3 { lin_rows_par(outs[j], x, ws[j], nil, pool, workers) }
+			return true
+		}
 		// The pool owns rows [mid, n) while the GPU owns [0, mid).
 		lin_rows_par_span(outs[i], x, ws[i], nil, acts, pool, workers, mid, n)
-	}
-	if e.stats != nil { e.stats.gpu_span += gms(_ts) }
-
-	_tj := time.tick_now()
-	for i in 0 ..< 3 {
-		if err := d3d12.gemm_finish_strided_slot(ge.dev, sc, outs[i].data, n, i); err != "" {
+		if err := d3d12.gemm_finish_strided(ge.dev, sc, outs[i].data, n); err != "" {
 			ge.err = fmt.tprintf("gpu exec %s: %s", ws[i].name, err)
 			ge.ok = false
 			lin_rows_par_span(outs[i], x, ws[i], nil, acts, pool, workers, 0, mid)
@@ -292,14 +249,13 @@ gpu_qkv_rows :: proc(e: ^Encoder, q, k, v, x: Mat, wq, wk, wv: Gguf_Tensor) -> b
 			return true
 		}
 	}
-	if e.stats != nil { e.stats.gpu_join += gms(_tj) }
 	return true
 }
 
 // enc_lin_rows is the encoder's linear: GPU+CPU row-split when the sidecar
 // is live and the shape qualifies, the pooled CPU kernels otherwise.
 enc_lin_rows :: proc(e: ^Encoder, out, x: Mat, w: Gguf_Tensor, bias: []f32) {
-	if gpu_lin_rows(out, x, w, bias, e.gpu, e.pool, e.workers, e.stats) { return }
+	if gpu_lin_rows(out, x, w, bias, e.gpu, e.pool, e.workers) { return }
 	lin_rows_par(out, x, w, bias, e.pool, e.workers)
 }
 

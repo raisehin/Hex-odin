@@ -262,5 +262,4 @@ cmd_gpuenc :: proc(args: []string) {
 		stats.attn_qkv, stats.attn_score, stats.ffn, stats.conv, stats.norm, stats.resid)
 	fmt.printf("GPUENC attn_split sc=%.1f av=%.1f out=%.1f\n",
 		stats.attn_sc, stats.attn_av, stats.attn_out)
-	fmt.printf("GPUENC gpu_split up=%.1f span=%.1f join=%.1f\n", stats.gpu_up, stats.gpu_span, stats.gpu_join)
 }
