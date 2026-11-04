@@ -281,6 +281,10 @@ transcribe_run :: proc(model_id: string, samples: []f32, language := "") -> (tex
 	samples, trimmed_ms := trim_trailing_silence(samples)
 	use_lang := language if len(language) > 0 else cfg.language
 	t_asr := time.tick_now()
+	// Measured here, before inference starts, so this stays a pure model wait.
+	// Taking it after inference made it "everything elapsed" and the two fields
+	// printed identical numbers (3162/3162, 704/703).
+	wait_ms := time.duration_milliseconds(time.tick_since(t_model))
 	set_transcribe_priority(true)
 	res_text: string
 	res_err: string
@@ -301,7 +305,6 @@ transcribe_run :: proc(model_id: string, samples: []f32, language := "") -> (tex
 	// when the preload already warmed the session, and the whole cost after an
 	// idle release, so the log answers "why was that one slow" directly.
 	if res_err == "" {
-		wait_ms := time.duration_milliseconds(time.tick_since(t_model))
 		infer_ms := time.duration_milliseconds(time.tick_since(t_asr))
 		log_write("[hex] asr: model-wait %.0f ms, inference %.0f ms (%d samples, %d ms tail trimmed)",
 			wait_ms, infer_ms, len(samples), trimmed_ms)
