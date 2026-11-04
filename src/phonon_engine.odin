@@ -23,6 +23,13 @@ asr_backend_for :: proc(model_id: string) -> Asr_Backend {
 	}
 	if b, ok := asr_backend_parse(config_load().engine); ok { return b }
 	if m := model_by_id(model_id); m != nil && m.family == "parakeet" {
+		// The shim now links ggml's Vulkan backend, which runs this model's
+		// encoder and decoder on the iGPU. Measured on a 10.9 s clip: 967 ms
+		// through ggml-Vulkan against 1590 ms for the Odin kernels' encoder
+		// alone, with identical text. Prefer it whenever the DLL is present;
+		// machines without the shim (or without a Vulkan device, where ggml
+		// falls back to its CPU backend) still get the Odin kernels.
+		if transcribe_available() { return .Shim }
 		return .Phonon
 	}
 	return .Shim

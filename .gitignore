@@ -140,3 +140,6 @@ venv/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Local Vulkan SDK + build artifacts used to compile ggml-vulkan (scripts/build-vulkan-shim.ps1)
+/toolchains/
