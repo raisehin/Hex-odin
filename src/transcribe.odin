@@ -21,6 +21,7 @@ Shim :: struct {
 	free_devices: proc "c" (p: cstring),
 	vad_init:    proc "c" (model: cstring) -> i32,
 	vad_speech:  proc "c" (samples: [^]f32, n: i32) -> i32,
+	vad_speech_end: proc "c" (samples: [^]f32, n: i32, min_silence_ms: i32) -> i64,
 	vad_free:    proc "c" (),
 	set_threads: proc "c" (n: i32),
 	close:       proc "c" (),
@@ -58,6 +59,7 @@ transcribe_available :: proc() -> bool {
 		shim.free_devices = cast(proc "c" (cstring))sym(lib, "hex_free")
 		shim.vad_init = cast(proc "c" (cstring) -> i32)sym(lib, "hex_vad_init")
 		shim.vad_speech = cast(proc "c" ([^]f32, i32) -> i32)sym(lib, "hex_vad_has_speech")
+		shim.vad_speech_end = cast(proc "c" ([^]f32, i32, i32) -> i64)sym(lib, "hex_vad_speech_end")
 		shim.vad_free = cast(proc "c" ())sym(lib, "hex_vad_free")
 		shim.set_threads = cast(proc "c" (i32))sym(lib, "hex_set_threads")
 		shim.close = cast(proc "c" ())sym(lib, "hex_model_close")
