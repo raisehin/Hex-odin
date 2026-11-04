@@ -503,9 +503,9 @@ hud_cancel_generation :: proc() -> int {
 // ~O(seconds), so moving finished audio off the critical path is the only
 // change here that shortens a long dictation rather than a short one.
 //
-// Off unless HEX_SEGMENTAL=1 while it proves itself on real dictation; the
-// splice points come from the VAD, so they cannot cut a word in half, and
-// each slice carries a little left context anyway.
+// On by default; HEX_SEGMENTAL=0 disables it. Splice points come from the VAD,
+// so they cannot cut a word in half, and each slice carries a little left
+// context anyway.
 SEG_MIN_SAMPLES :: 16000 // 1 s of new speech before a slice is worth encoding
 SEG_CTX_SAMPLES :: 3200  // 200 ms of left context per slice
 SEG_POLL_MS :: 250
@@ -519,7 +519,9 @@ seg_texts: [dynamic]string
 
 segmental_enabled :: proc() -> bool {
 	if shim.vad_speech_end == nil { return false }
-	return os.get_env("HEX_SEGMENTAL", context.temp_allocator) == "1"
+	// On by default; HEX_SEGMENTAL=0 restores the encode-everything-at-key-up
+	// path, and a shim without hex_vad_speech_end disables it automatically.
+	return os.get_env("HEX_SEGMENTAL", context.temp_allocator) != "0"
 }
 
 seg_worker :: proc(_: ^thread.Thread) {
