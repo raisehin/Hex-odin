@@ -37,6 +37,10 @@ HEX_API void hex_model_close(void);
 
 HEX_API int  hex_vad_init(const char *model_path);
 HEX_API int  hex_vad_has_speech(const float *samples, int count);
+// End sample of the last CLOSED speech segment (one followed by at least
+// min_silence_ms of audio), or -1 when none is closed yet. Lets the caller
+// transcribe finished segments while the user is still speaking.
+HEX_API long long hex_vad_speech_end(const float *samples, int count, int min_silence_ms);
 HEX_API void hex_vad_free(void);
 
 // CPU worker cap for the ASR session; 0 uses every usable core.

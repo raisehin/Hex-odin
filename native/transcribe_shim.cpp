@@ -223,6 +223,43 @@ extern "C" int hex_vad_has_speech(const float *samples, int count) {
 #endif
 }
 
+// End sample of the last speech segment that is already CLOSED in this audio,
+// i.e. it is followed by at least min_silence_ms of audio, so splicing there
+// cannot cut a word in half. Returns -1 when nothing is closed yet or the VAD
+// is unavailable, which tells the caller to keep accumulating.
+//
+// The VAD already computes these boundaries for hex_vad_has_speech and threw
+// them away; this exposes them so the caller can transcribe a finished segment
+// while the user is still talking, instead of encoding the whole dictation
+// after key-up.
+extern "C" long long hex_vad_speech_end(const float *samples, int count, int min_silence_ms) {
+#ifdef HEX_HAVE_TRANSCRIBE
+    if (!g_vad_session || !samples || count <= 0) return -1;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    transcribe_vad_params params;
+    transcribe_vad_params_init(&params);
+    if (min_silence_ms <= 0) min_silence_ms = params.min_silence_ms;
+    if (transcribe_vad_run(g_vad_session, samples, count, &params) != TRANSCRIBE_OK) return -1;
+    transcribe_vad_result result;
+    transcribe_vad_result_init(&result);
+    if (transcribe_vad_get_result(g_vad_session, &result) != TRANSCRIBE_OK) return -1;
+    // 16 kHz: the VAD session runs at the model rate.
+    const long long closed_before = (long long)count - (long long)min_silence_ms * 16LL;
+    long long best = -1;
+    for (int i = 0; i < result.n_segments; ++i) {
+        transcribe_vad_segment seg;
+        transcribe_vad_segment_init(&seg);
+        if (transcribe_vad_get_segment(g_vad_session, i, &seg) != TRANSCRIBE_OK) continue;
+        if (seg.end_sample > closed_before) continue; // still open, speech may resume
+        if (seg.end_sample > best) best = seg.end_sample;
+    }
+    return best;
+#else
+    (void)samples; (void)count; (void)min_silence_ms;
+    return -1;
+#endif
+}
+
 extern "C" void hex_vad_free(void) {
 #ifdef HEX_HAVE_TRANSCRIBE
     std::lock_guard<std::mutex> lock(g_mutex);

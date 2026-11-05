@@ -4,6 +4,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:math"
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
@@ -400,6 +401,16 @@ hud_toggle :: proc() {
 		// 890 ms of model init and 7.5 ms of VAD init overlap the recording
 		// instead of landing between the key release and the paste.
 		preload_model_async()
+		if segmental_enabled() {
+			seg_cursor = 0
+			seg_model = config_load().model
+			clear(&seg_texts)
+			sync.atomic_store(&seg_stop, i32(0))
+			seg_thread = thread.create(seg_worker)
+			if seg_thread != nil {
+				thread.start(seg_thread)
+			}
+		}
 	} else {
 		hud.recording = false
 		hud_set_pump(false)
@@ -486,6 +497,66 @@ hud_cancel_generation :: proc() -> int {
 	return hud.cancel_gen
 }
 
+// --- Segmental dictation ------------------------------------------------
+// While the user is still talking, transcribe every speech segment the VAD
+// has already closed, so key-up only has to encode the tail. The encoder is
+// ~O(seconds), so moving finished audio off the critical path is the only
+// change here that shortens a long dictation rather than a short one.
+//
+// On by default; HEX_SEGMENTAL=0 disables it. Splice points come from the VAD,
+// so they cannot cut a word in half, and each slice carries a little left
+// context anyway.
+SEG_MIN_SAMPLES :: 16000 // 1 s of new speech before a slice is worth encoding
+SEG_CTX_SAMPLES :: 3200  // 200 ms of left context per slice
+SEG_POLL_MS :: 250
+SEG_SILENCE_MS :: 300    // silence that closes a segment
+
+seg_thread: ^thread.Thread
+seg_stop: i32
+seg_cursor: int
+seg_model: string
+seg_texts: [dynamic]string
+
+segmental_enabled :: proc() -> bool {
+	if shim.vad_speech_end == nil { return false }
+	// On by default; HEX_SEGMENTAL=0 restores the encode-everything-at-key-up
+	// path, and a shim without hex_vad_speech_end disables it automatically.
+	return os.get_env("HEX_SEGMENTAL", context.temp_allocator) != "0"
+}
+
+seg_worker :: proc(_: ^thread.Thread) {
+	for sync.atomic_load(&seg_stop) == 0 {
+		time.sleep(SEG_POLL_MS * time.Millisecond)
+		if sync.atomic_load(&seg_stop) != 0 { break }
+
+		end := 0
+		slice: []f32
+		sync.lock(&hud.buffer_lock)
+		if hud.buffer != nil {
+			buf := hud.buffer^
+			if len(buf) > SEG_CTX_SAMPLES {
+				end = int(shim.vad_speech_end(raw_data(buf), i32(len(buf)), SEG_SILENCE_MS))
+			}
+			if end > seg_cursor+SEG_MIN_SAMPLES && end <= len(buf) {
+				lo := max(0, seg_cursor-SEG_CTX_SAMPLES)
+				slice = make([]f32, end-lo)
+				copy(slice, buf[lo:end])
+			}
+		}
+		sync.unlock(&hud.buffer_lock)
+		if slice == nil { continue }
+
+		text, err := transcribe_run(seg_model, slice)
+		delete(slice)
+		if err != "" {
+			delete(err)
+		} else if len(text) > 0 {
+			append(&seg_texts, text)
+		}
+		seg_cursor = end
+	}
+}
+
 TranscribeJob :: struct {
 	audio: []f32,
 	gen:   int,
@@ -500,9 +571,14 @@ hud_transcribe_async :: proc() {
 		return
 	}
 	// The recording buffer is reused by the next recording; the transcription
-	// gets its own copy so a new one cannot move memory under it.
-	audio := make([]f32, len(hud.buffer^))
-	copy(audio, hud.buffer^[:])
+	// gets its own copy so a new one cannot move memory under it. When the
+	// background segmenter is running the worker stops it first and copies
+	// only the tail, so the copy is deferred to it.
+	audio: []f32
+	if seg_thread == nil {
+		audio = make([]f32, len(hud.buffer^))
+		copy(audio, hud.buffer^[:])
+	}
 	sync.unlock(&hud.buffer_lock)
 
 	job := new(TranscribeJob)
@@ -545,9 +621,29 @@ hud_transcribe_async :: proc() {
 
 transcribe_worker :: proc(t: ^thread.Thread) {
 	job := cast(^TranscribeJob)t.data
-	audio := job.audio
 	gen := job.gen
 	cfg := config_load()
+	audio := job.audio
+	// Segmental: stop the background segmenter, then encode only the tail.
+	// The join waits at most one in-flight segment, which is the whole point:
+	// that work already happened while the user was still talking.
+	prefix: []string
+	if seg_thread != nil {
+		sync.atomic_store(&seg_stop, i32(1))
+		thread.join(seg_thread)
+		thread.destroy(seg_thread)
+		seg_thread = nil
+	}
+	prefix = seg_texts[:]
+	if audio == nil {
+		sync.lock(&hud.buffer_lock)
+		if hud.buffer != nil && seg_cursor < len(hud.buffer^) {
+			audio = make([]f32, len(hud.buffer^)-seg_cursor)
+			copy(audio, hud.buffer^[seg_cursor:])
+		}
+		sync.unlock(&hud.buffer_lock)
+		job.audio = audio
+	}
 	defer {
 		// The dictation's lines (paste text, errors) go out before the
 		// worker disappears, so a diagnostic read afterwards is complete.
@@ -561,11 +657,22 @@ transcribe_worker :: proc(t: ^thread.Thread) {
 		free(job)
 	}
 
-	if os.get_env("HEX_SKIP_VAD", context.temp_allocator) == "" && !vad_has_speech(audio) {
+	start := time.now()
+	if len(prefix) == 0 && os.get_env("HEX_SKIP_VAD", context.temp_allocator) == "" && !vad_has_speech(audio) {
 		log_write("[hex] no speech")
 		return
 	}
-	start := time.now()
+	if audio == nil || len(audio) == 0 {
+		// Every second already went out as a closed segment; nothing to add.
+		if len(prefix) > 0 && hud_cancel_generation() == gen {
+			full := strings.join(prefix, " ")
+			defer delete(full)
+			if paste_text(full) {
+				log_write("[hex] pasted segmental %.2fs: %s", time.duration_seconds(time.since(start)), full)
+			}
+		}
+		return
+	}
 	text, err := transcribe_run(cfg.model, audio)
 	elapsed := time.duration_seconds(time.since(start))
 	if err != "" {
@@ -578,8 +685,17 @@ transcribe_worker :: proc(t: ^thread.Thread) {
 		log_write("[hex] cancelled before paste")
 		return
 	}
-	if paste_text(text) {
-		log_write("[hex] pasted %.2fs: %s", elapsed, text)
+	// Closed segments first, then the tail, as one paste in spoken order.
+	full := text
+	if len(prefix) > 0 {
+		parts := make([dynamic]string, 0, len(prefix)+1, context.temp_allocator)
+		for p in prefix { append(&parts, p) }
+		if len(text) > 0 { append(&parts, text) }
+		full = strings.join(parts[:], " ")
+		defer delete(full)
+	}
+	if paste_text(full) {
+		log_write("[hex] pasted %.2fs: %s", elapsed, full)
 	} else {
 		log_write("[hex] paste failed")
 	}

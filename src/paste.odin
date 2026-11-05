@@ -145,7 +145,7 @@ paste_text :: proc(text: string) -> bool {
 		// the user asked for, so the transcript replaces it; only the text
 		// clipboard is restored, so say which payload was dropped.
 		log_write(fmt.aprintf("[hex] replacing non-restorable clipboard (%s) with the transcript",
-			clip_content_format_names(), context.temp_allocator))
+			clip_content_format_names()))
 	}
 
 	if !clip_write_text(text) {

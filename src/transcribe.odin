@@ -21,6 +21,7 @@ Shim :: struct {
 	free_devices: proc "c" (p: cstring),
 	vad_init:    proc "c" (model: cstring) -> i32,
 	vad_speech:  proc "c" (samples: [^]f32, n: i32) -> i32,
+	vad_speech_end: proc "c" (samples: [^]f32, n: i32, min_silence_ms: i32) -> i64,
 	vad_free:    proc "c" (),
 	set_threads: proc "c" (n: i32),
 	close:       proc "c" (),
@@ -58,6 +59,7 @@ transcribe_available :: proc() -> bool {
 		shim.free_devices = cast(proc "c" (cstring))sym(lib, "hex_free")
 		shim.vad_init = cast(proc "c" (cstring) -> i32)sym(lib, "hex_vad_init")
 		shim.vad_speech = cast(proc "c" ([^]f32, i32) -> i32)sym(lib, "hex_vad_has_speech")
+		shim.vad_speech_end = cast(proc "c" ([^]f32, i32, i32) -> i64)sym(lib, "hex_vad_speech_end")
 		shim.vad_free = cast(proc "c" ())sym(lib, "hex_vad_free")
 		shim.set_threads = cast(proc "c" (i32))sym(lib, "hex_set_threads")
 		shim.close = cast(proc "c" ())sym(lib, "hex_model_close")
@@ -281,6 +283,10 @@ transcribe_run :: proc(model_id: string, samples: []f32, language := "") -> (tex
 	samples, trimmed_ms := trim_trailing_silence(samples)
 	use_lang := language if len(language) > 0 else cfg.language
 	t_asr := time.tick_now()
+	// Measured here, before inference starts, so this stays a pure model wait.
+	// Taking it after inference made it "everything elapsed" and the two fields
+	// printed identical numbers (3162/3162, 704/703).
+	wait_ms := time.duration_milliseconds(time.tick_since(t_model))
 	set_transcribe_priority(true)
 	res_text: string
 	res_err: string
@@ -301,7 +307,6 @@ transcribe_run :: proc(model_id: string, samples: []f32, language := "") -> (tex
 	// when the preload already warmed the session, and the whole cost after an
 	// idle release, so the log answers "why was that one slow" directly.
 	if res_err == "" {
-		wait_ms := time.duration_milliseconds(time.tick_since(t_model))
 		infer_ms := time.duration_milliseconds(time.tick_since(t_asr))
 		log_write("[hex] asr: model-wait %.0f ms, inference %.0f ms (%d samples, %d ms tail trimmed)",
 			wait_ms, infer_ms, len(samples), trimmed_ms)
