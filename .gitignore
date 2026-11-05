@@ -9,6 +9,10 @@
 # generated artifacts. No upstream PRs for now, so none of it is worth pushing.
 # =============================================================================
 
+# Local agent notes: working state for coding agents, not shippable sources.
+/AGENTS.md
+/CLAUDE.md
+
 # Build output ---------------------------------------------------------------
 # build.ps1 writes the exe, its PDB, the icon intermediates and the shim here.
 /bin/
@@ -67,6 +71,9 @@ cmake_install.cmake
 /phonon-rs-master/
 /reference/
 /vendor_src/
+# Upstream ggml clone, kept only to diff against the copy vendored inside
+# native/third_party/transcribe.cpp (0.26.0 there, master here). Never built.
+/.upstream-ggml/
 
 # Local research scaffolding -------------------------------------------------
 /.swarm/
