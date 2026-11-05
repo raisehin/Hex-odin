@@ -85,6 +85,10 @@ Gguf :: struct {
 	kv:       map[string]Gguf_Value,
 	order:    []string, // tensor names in file order
 	alignment: u64,
+	// alloc owns data, the cloned metadata strings, tensor names, and the
+	// decoded Q8_0 scales. The two maps are allocated with the context
+	// allocator, so they are deleted without it.
+	alloc: mem.Allocator,
 }
 
 // Elements per block and bytes per block; 1/1 for plain types.
@@ -208,15 +212,29 @@ gguf_load :: proc(path: string, alloc := context.allocator) -> (g: Gguf, err: st
 	data, rerr := os.read_entire_file_from_path(path, alloc)
 	if rerr != nil { return {}, fmt.tprintf("gguf: cannot read %s: %v", path, rerr) }
 	g.data = data
+	g.alloc = alloc
 	g.alignment = 32
 	g.tensors = make(map[string]Gguf_Tensor, 1024)
 	g.kv = make(map[string]Gguf_Value, 64)
+	// Every error below must go through the defer: by this point data, keys,
+	// values and tensor names are already owned.
+	loaded := false
+	defer {
+		if !loaded { gguf_destroy(&g) }
+	}
 
 	r := Reader{data = data}
 	magic := read_pod(&r, u32)
-	if magic != GGUF_MAGIC { return {}, "gguf: bad magic" }
+	if magic != GGUF_MAGIC {
+		gguf_destroy(&g)
+		return {}, "gguf: bad magic"
+	}
 	version := read_pod(&r, u32)
-	if version != 3 { return {}, fmt.tprintf("gguf: unsupported version %d", version) }
+	if version != 3 {
+		msg := fmt.tprintf("gguf: unsupported version %d", version)
+		gguf_destroy(&g)
+		return {}, msg
+	}
 	n_tensors := read_pod(&r, u64)
 	n_kv := read_pod(&r, u64)
 
@@ -236,7 +254,12 @@ gguf_load :: proc(path: string, alloc := context.allocator) -> (g: Gguf, err: st
 	for i in 0 ..< int(n_tensors) {
 		name := read_string(&r, alloc)
 		n_dims := read_pod(&r, u32)
-		if n_dims > 4 { return {}, fmt.tprintf("gguf: tensor %s has %d dims", name, n_dims) }
+		if n_dims > 4 {
+			msg := fmt.tprintf("gguf: tensor %s has %d dims", name, n_dims)
+			if name != "" { delete(name, alloc) }
+			gguf_destroy(&g)
+			return {}, msg
+		}
 		t := Gguf_Tensor{name = name, n_dims = n_dims}
 		for d in 0 ..< int(n_dims) { t.dims[d] = read_pod(&r, u64) }
 		t.type = read_pod(&r, GGML_Type)
@@ -247,15 +270,31 @@ gguf_load :: proc(path: string, alloc := context.allocator) -> (g: Gguf, err: st
 
 	// The tensor data region starts after the info block, aligned up.
 	data_start := (u64(r.pos) + g.alignment - 1) / g.alignment * g.alignment
-	if data_start > u64(len(data)) { return {}, "gguf: truncated tensor data" }
+	if data_start > u64(len(data)) {
+		gguf_destroy(&g)
+		return {}, "gguf: truncated tensor data"
+	}
 	for t in infos {
 		n_elements := u64(1)
 		for d in 0 ..< int(t.n_dims) { n_elements *= t.dims[d] }
 		nbytes, ok := gguf_tensor_bytes(t.type, n_elements)
-		if !ok { return {}, fmt.tprintf("gguf: tensor %s type %d unsupported", t.name, t.type) }
+		if !ok {
+			msg := fmt.tprintf("gguf: tensor %s type %d unsupported", t.name, t.type)
+			gguf_destroy(&g)
+			return {}, msg
+		}
 		start := data_start + t.offset
 		if start + nbytes > u64(len(data)) {
-			return {}, fmt.tprintf("gguf: tensor %s out of bounds", t.name)
+			msg := fmt.tprintf("gguf: tensor %s out of bounds", t.name)
+			gguf_destroy(&g)
+			return {}, msg
+		}
+		// A Q8_0 row is dotted in whole 32-value blocks; a row length that
+		// is not a multiple of 32 would make the kernel read past the row.
+		if t.type == .Q8_0 && t.n_dims > 0 && t.dims[0] % Q8_0_QUANT_SIZEOF != 0 {
+			msg := fmt.tprintf("gguf: tensor %s row length %d is not a multiple of 32", t.name, t.dims[0])
+			gguf_destroy(&g)
+			return {}, msg
 		}
 		tt := t
 		tt.bytes = data[int(start):int(start + nbytes)]
@@ -268,17 +307,37 @@ gguf_load :: proc(path: string, alloc := context.allocator) -> (g: Gguf, err: st
 		}
 		g.tensors[t.name] = tt
 	}
+	loaded = true
 	return g, ""
 }
 
 gguf_destroy :: proc(g: ^Gguf) {
-	for _, t in g.tensors {
-		if t.scales != nil { delete(t.scales) }
+	alloc := g.alloc
+	if alloc.procedure == nil { alloc = context.allocator }
+	// g.order owns every tensor name once; g.tensors keys are views of the
+	// same strings and must not be freed again.
+	for name in g.order {
+		if name != "" { delete(name, alloc) }
 	}
-	if g.data != nil { delete(g.data) }
+	for key, v in g.kv {
+		if key != "" { delete(key, alloc) }
+		if s, ok := v.(string); ok {
+			if s != "" { delete(s, alloc) }
+		} else if arr, aok := v.([]string); aok {
+			for elem in arr { if elem != "" { delete(elem, alloc) } }
+			if arr != nil { delete(arr, alloc) }
+		} else if nums, nok := v.([]i64); nok {
+			if nums != nil { delete(nums, alloc) }
+		}
+	}
+	for _, t in g.tensors {
+		if t.scales != nil { delete(t.scales, alloc) }
+	}
+	if g.data != nil { delete(g.data, alloc) }
 	delete(g.tensors)
 	delete(g.kv)
-	delete(g.order)
+	if g.order != nil { delete(g.order, alloc) }
+	g^ = {}
 }
 
 // gguf_int returns an integer metadata entry, or def.

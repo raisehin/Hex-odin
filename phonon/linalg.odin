@@ -49,7 +49,7 @@ half_to_float :: #force_inline proc "contextless" (h: u16) -> f32 {
 		return transmute(f32)(sign | 0x7F80_0000 | (mant << 13))
 	case exp == 0:
 		if mant == 0 { return transmute(f32)(sign) }
-		e := u32(127 - 15)
+		e := u32(127 - 14)
 		for mant & 0x0400 == 0 {
 			mant <<= 1
 			e -= 1

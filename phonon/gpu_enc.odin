@@ -19,6 +19,7 @@ package phonon
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strings"
 import "core:time"
 import d3d12 "./d3d12"
 
@@ -62,7 +63,9 @@ gpu_enc_open :: proc() -> ^Gpu_Enc {
 	ge.scratch = make(map[[3]int]^d3d12.Scratch)
 	dev, err := d3d12.gpu_init(d3d12.Q8_0_GEMM_DXIL)
 	if err != "" {
-		ge.err = err
+		// gpu_init reports through fmt.tprintf (the temporary allocator), so
+		// the message must be copied before this scope ends.
+		ge.err = strings.clone(err)
 		return ge
 	}
 	ge.dev = dev
@@ -89,6 +92,7 @@ gpu_enc_close :: proc(ge: ^Gpu_Enc) {
 	for _, w in ge.weights { d3d12.weights_destroy(w) }
 	delete(ge.weights)
 	d3d12.gpu_destroy(ge.dev)
+	if ge.err != "" { delete(ge.err) }
 	free(ge)
 }
 

@@ -77,7 +77,12 @@ float_to_half :: #force_inline proc "contextless" (f: f32) -> u16 {
 	exp := i32((u >> 23) & 0xff)
 	mant := u & 0x7fffff
 	if exp == 0xff { // inf / nan
-		return sign | 0x7c00 | u16(mant >> 13)
+		if mant == 0 { return sign | 0x7c00 }
+		// Quiet NaN, payload truncated to the f16 mantissa. A bare
+		// `sign | 0x7c00 | (mant >> 13)` turns any NaN whose low 23
+		// mantissa bits are below 0x2000 into infinity; the 0x0200 bit
+		// keeps it a NaN.
+		return sign | 0x7c00 | 0x0200 | u16(mant >> 13)
 	}
 	e := exp - 127 + 15
 	if e >= 0x1f {
@@ -149,10 +154,16 @@ qk_pf :: #force_inline proc "contextless" (woff, qoff: uintptr) -> simd.f32x8 {
 
 // qk_pf_w is qk_pf for an already-loaded weight block, so a caller that dots
 // one block against several activation rows loads those 32 bytes once.
+//
+// The unsigned operand is |w| and the signed operand is sign(w)*x, not the
+// other way round: Q8_0 weights can legally contain -128 (though ggml's
+// quantiser does not emit it), and abs of an i8 -128 is still -128, so
+// abs(-128) as the unsigned operand means 128, which vpmaddubsw handles
+// exactly. The signed operand is at most |x| <= 127, so it never overflows.
 @(private, require_results, enable_target_feature = "avx2")
 qk_pf_w :: #force_inline proc "contextless" (wv: simd.i8x32, qoff: uintptr) -> simd.f32x8 {
 	xv := qk_load_i8x32(rawptr(qoff))
-	p16 := qk_pmaddubsw(simd.abs(xv), qk_signmul(wv, xv))
+	p16 := qk_pmaddubsw(simd.abs(wv), qk_signmul(xv, wv))
 	return simd.f32x8(qk_pmaddwd(p16, simd.i16x16(1)))
 }
 
@@ -273,12 +284,13 @@ q8_0_dot_q8_2f :: proc "contextless" (w: []u8, ws: []f32, qa: []i8, da: []f32, q
 	return
 }
 
-// qk_pf_w2 is qk_pf_w with the activation's sign already split out: xabs is
-// abs(x) and xv the raw activation. Two weight rows dotted against the same
-// frame share one xabs, one load and one abs.
+// qk_pf_w2 is qk_pf_w with the weight's abs already split out: wabs is |w|
+// and xv the raw activation. Several frames dotted against the same row share
+// one wabs, one load and one abs. Folding the sign into the activation
+// (sign(w)*x) keeps the signed operand in [-127, 127] even when w is -128.
 @(private, require_results, enable_target_feature = "avx2")
-qk_pf_w2 :: #force_inline proc "contextless" (wv, xv, xabs: simd.i8x32) -> simd.f32x8 {
-	return simd.f32x8(qk_pmaddwd(qk_pmaddubsw(xabs, qk_signmul(wv, xv)), simd.i16x16(1)))
+qk_pf_w2 :: #force_inline proc "contextless" (wv, wabs, xv: simd.i8x32) -> simd.f32x8 {
+	return simd.f32x8(qk_pmaddwd(qk_pmaddubsw(wabs, qk_signmul(xv, wv)), simd.i16x16(1)))
 }
 
 // q8_0_dot_q8_2f_2r dots two adjacent weight rows against two adjacent
@@ -326,16 +338,16 @@ q8_0_dot_q8_2f_2r :: proc "contextless" (
 			wvb := qk_load_i8x32(rawptr(wbp + wo + 2))
 			x0 := qk_load_i8x32(rawptr(q0p + qo))
 			x1 := qk_load_i8x32(rawptr(q1p + qo))
-			ax0 := simd.abs(x0)
-			ax1 := simd.abs(x1)
+			awa := simd.abs(wva)
+			awb := simd.abs(wvb)
 			sa := (cast(^f32)(wsap + dof))^
 			sb := (cast(^f32)(wsbp + dof))^
 			da0 := (cast(^f32)(d0p + dof))^
 			db0 := (cast(^f32)(d1p + dof))^
-			aa0 = simd.fma(qk_pf_w2(wva, x0, ax0), simd.f32x8(sa * da0), aa0)
-			ba0 = simd.fma(qk_pf_w2(wvb, x0, ax0), simd.f32x8(sb * da0), ba0)
-			ab0 = simd.fma(qk_pf_w2(wva, x1, ax1), simd.f32x8(sa * db0), ab0)
-			bb0 = simd.fma(qk_pf_w2(wvb, x1, ax1), simd.f32x8(sb * db0), bb0)
+			aa0 = simd.fma(qk_pf_w2(wva, awa, x0), simd.f32x8(sa * da0), aa0)
+			ba0 = simd.fma(qk_pf_w2(wvb, awb, x0), simd.f32x8(sb * da0), ba0)
+			ab0 = simd.fma(qk_pf_w2(wva, awa, x1), simd.f32x8(sa * db0), ab0)
+			bb0 = simd.fma(qk_pf_w2(wvb, awb, x1), simd.f32x8(sb * db0), bb0)
 		}
 		{
 			wo := uintptr((b + 1) * Q8_0_BLOCK_SIZEOF)
@@ -345,16 +357,16 @@ q8_0_dot_q8_2f_2r :: proc "contextless" (
 			wvb := qk_load_i8x32(rawptr(wbp + wo + 2))
 			x0 := qk_load_i8x32(rawptr(q0p + qo))
 			x1 := qk_load_i8x32(rawptr(q1p + qo))
-			ax0 := simd.abs(x0)
-			ax1 := simd.abs(x1)
+			awa := simd.abs(wva)
+			awb := simd.abs(wvb)
 			sa := (cast(^f32)(wsap + dof))^
 			sb := (cast(^f32)(wsbp + dof))^
 			da0 := (cast(^f32)(d0p + dof))^
 			db0 := (cast(^f32)(d1p + dof))^
-			aa1 = simd.fma(qk_pf_w2(wva, x0, ax0), simd.f32x8(sa * da0), aa1)
-			ba1 = simd.fma(qk_pf_w2(wvb, x0, ax0), simd.f32x8(sb * da0), ba1)
-			ab1 = simd.fma(qk_pf_w2(wva, x1, ax1), simd.f32x8(sa * db0), ab1)
-			bb1 = simd.fma(qk_pf_w2(wvb, x1, ax1), simd.f32x8(sb * db0), bb1)
+			aa1 = simd.fma(qk_pf_w2(wva, awa, x0), simd.f32x8(sa * da0), aa1)
+			ba1 = simd.fma(qk_pf_w2(wvb, awb, x0), simd.f32x8(sb * da0), ba1)
+			ab1 = simd.fma(qk_pf_w2(wva, awa, x1), simd.f32x8(sa * db0), ab1)
+			bb1 = simd.fma(qk_pf_w2(wvb, awb, x1), simd.f32x8(sb * db0), bb1)
 		}
 	}
 	for ; b < blocks; b += 1 {
@@ -365,16 +377,16 @@ q8_0_dot_q8_2f_2r :: proc "contextless" (
 		wvb := qk_load_i8x32(rawptr(wbp + wo + 2))
 		x0 := qk_load_i8x32(rawptr(q0p + qo))
 		x1 := qk_load_i8x32(rawptr(q1p + qo))
-		ax0 := simd.abs(x0)
-		ax1 := simd.abs(x1)
+		awa := simd.abs(wva)
+		awb := simd.abs(wvb)
 		sa := (cast(^f32)(wsap + dof))^
 		sb := (cast(^f32)(wsbp + dof))^
 		da0 := (cast(^f32)(d0p + dof))^
 		db0 := (cast(^f32)(d1p + dof))^
-		aa0 = simd.fma(qk_pf_w2(wva, x0, ax0), simd.f32x8(sa * da0), aa0)
-		ba0 = simd.fma(qk_pf_w2(wvb, x0, ax0), simd.f32x8(sb * da0), ba0)
-		ab0 = simd.fma(qk_pf_w2(wva, x1, ax1), simd.f32x8(sa * db0), ab0)
-		bb0 = simd.fma(qk_pf_w2(wvb, x1, ax1), simd.f32x8(sb * db0), bb0)
+		aa0 = simd.fma(qk_pf_w2(wva, awa, x0), simd.f32x8(sa * da0), aa0)
+		ba0 = simd.fma(qk_pf_w2(wvb, awb, x0), simd.f32x8(sb * da0), ba0)
+		ab0 = simd.fma(qk_pf_w2(wva, awa, x1), simd.f32x8(sa * db0), ab0)
+		bb0 = simd.fma(qk_pf_w2(wvb, awb, x1), simd.f32x8(sb * db0), bb0)
 	}
 	a0 = simd.reduce_add_ordered(aa0 + aa1)
 	b0 = simd.reduce_add_ordered(ba0 + ba1)
@@ -542,6 +554,13 @@ Conv_1x1_Ctx :: struct {
 	ocs: int,
 }
 
+// conv_bias_at returns bias[i], or 0 for a bias-less convolution. conv_1x1
+// used to dereference a nil bias slice unconditionally.
+@(private, enable_target_feature = "avx2")
+conv_bias_at :: #force_inline proc "contextless" (bias: []f32, i: int) -> f32 {
+	return i < len(bias) ? bias[i] : 0
+}
+
 // conv_1x1_chunk runs eight positions at a time against four output channels at
 // once. Four accumulators is what makes it throughput- rather than latency-bound:
 // a single fma chain stalls on its own latency (4 cycles per eight products,
@@ -570,7 +589,7 @@ conv_1x1_chunk :: proc(data: rawptr, lo, hi: int) #no_bounds_check {
 					// thread count.
 					s: f32 = 0
 					for i in 0 ..< ics { s += row[i] * c.x[i * c.pos + p0 + j] }
-					c.out[o * c.pos + p0 + j] = s + c.bias[o]
+					c.out[o * c.pos + p0 + j] = s + conv_bias_at(c.bias, o)
 				}
 			}
 			continue
@@ -592,10 +611,10 @@ conv_1x1_chunk :: proc(data: rawptr, lo, hi: int) #no_bounds_check {
 				a3 = simd.fma(simd.f32x8((cast(^f32)(rawptr(r0 + 3 * w4 + o4)))^), xv, a3)
 			}
 			dst := outp + uintptr((o * c.pos + p0) * 4)
-			qk_store8(rawptr(dst), a0 + simd.f32x8(c.bias[o]))
-			qk_store8(rawptr(dst + uintptr(c.pos * 4)), a1 + simd.f32x8(c.bias[o + 1]))
-			qk_store8(rawptr(dst + uintptr(c.pos * 8)), a2 + simd.f32x8(c.bias[o + 2]))
-			qk_store8(rawptr(dst + uintptr(c.pos * 12)), a3 + simd.f32x8(c.bias[o + 3]))
+			qk_store8(rawptr(dst), a0 + simd.f32x8(conv_bias_at(c.bias, o)))
+			qk_store8(rawptr(dst + uintptr(c.pos * 4)), a1 + simd.f32x8(conv_bias_at(c.bias, o + 1)))
+			qk_store8(rawptr(dst + uintptr(c.pos * 8)), a2 + simd.f32x8(conv_bias_at(c.bias, o + 2)))
+			qk_store8(rawptr(dst + uintptr(c.pos * 12)), a3 + simd.f32x8(conv_bias_at(c.bias, o + 3)))
 		}
 		for ; o < c.ocs; o += 1 {
 			row := c.w[o * ics:][:ics]
@@ -603,7 +622,7 @@ conv_1x1_chunk :: proc(data: rawptr, lo, hi: int) #no_bounds_check {
 			for i in 0 ..< ics {
 				acc = simd.fma(simd.f32x8(row[i]), qk_load8(rawptr(xp + uintptr(p0 * 4) + uintptr(i) * pos4)), acc)
 			}
-			qk_store8(rawptr(outp + uintptr((o * c.pos + p0) * 4)), acc + simd.f32x8(c.bias[o]))
+			qk_store8(rawptr(outp + uintptr((o * c.pos + p0) * 4)), acc + simd.f32x8(conv_bias_at(c.bias, o)))
 		}
 	}
 }
