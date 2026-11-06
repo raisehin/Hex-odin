@@ -69,6 +69,9 @@ cmake_install.cmake
 /vendor_src/
 
 # Local research scaffolding -------------------------------------------------
+# Unreferenced D3D12 tiled-GEMM shader draft: not built by build_shaders.ps1
+# and not loaded by anything, kept locally only.
+/phonon/d3d12/q8_0_gemm_tiled.hlsl
 /.swarm/
 /autoresearch*
 !/autoresearch.sh
