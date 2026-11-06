@@ -158,10 +158,19 @@ try {
     if ($Native) {
         $cmake = Get-Command cmake -ErrorAction SilentlyContinue
         if (-not $cmake) { throw "-Native needs cmake on PATH" }
-        & $cmake.Source -S native -B native/build -DCMAKE_BUILD_TYPE=Release
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        & $cmake.Source --build native/build --config Release
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        # cmake and MSBuild write ordinary warnings to stderr. With
+        # $ErrorActionPreference = 'Stop' PowerShell turns each one into a
+        # NativeCommandError and aborts a build that actually succeeded, so
+        # relax it here and gate on the exit code alone.
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $cmake.Source -S native -B native/build -DCMAKE_BUILD_TYPE=Release
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & $cmake.Source --build native/build --config Release
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        } finally {
+            $ErrorActionPreference = 'Stop'
+        }
     }
 
     # The app loads the shim from its own directory first (src/transcribe.odin).
