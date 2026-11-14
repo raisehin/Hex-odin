@@ -1,25 +1,50 @@
 # hex (Odin)
 
-Hex's dictation core in plain Odin: capture, the Dot-scope overlay, hotkeys,
-clipboard paste — and the speech recogniser too.
+An Odin reimplementation of **Hex**, opencode's Rust dictation app. The Rust
+app (Hex 3.4.0) is the behavioural reference; this repository is not a wrapper
+around it and runs no Rust at runtime. Capture, hotkeys, clipboard paste, the
+Dot-scope overlay and the speech recogniser are Windows Odin code. The port is
+not feature-complete: Rune's window/pane system, local API and updater are not
+ported.
 
 `phonon/` is a hand-written inference engine for **Phonon-2.5 English**
 (Fermion Research, 0.6B TDT / Parakeet family): it reads the shipped
 `Q8_0`/`F16` GGUF directly, runs the NeMo log-mel frontend, a 24-block
 conformer encoder and the TDT decoder, and does its own matmuls with
 **AVX2 / FMA kernels written for Zen 2** — no ggml, no BLAS, no C++ on
-the ASR path. The C++ stack (`transcribe.cpp` / `ggml`) is still linked as a
-reference oracle and as the path for every other model family.
+the ASR path. The optional C++ stack (`transcribe.cpp` / `ggml`) is the
+numerical oracle and the path for every other model family; the app builds and
+runs without it.
 
 The claim it has to defend is not "it runs" but "it computes the same thing":
 both engines produce **byte-identical transcripts** on the benchmark clips, and
 the encoder stages match the reference dumps at 1, 2, 4, 6 and 8 threads.
 
+## Current state
+
+- `main` builds from a clean checkout with only the pinned Odin compiler. The
+  app-only `bin\hex.exe` needs no model, Python, CMake, native shim, or
+  `%APPDATA%\hex` state to build or run `hex version`.
+- Two ASR backends: the in-repo Phonon engine is the default for Phonon models;
+  the optional `transcribe.cpp` shim is the reference/other-family path. The app
+  runs without the shim.
+- The HUD is not a mock: it runs the real `Scope`/`Indicator` simulation plus a
+  CPU port of `rune_hud.wgsl`'s fragment path.
+- Logging is off by default. Use `hex log file` or `HEX_LOG=file` to opt in; a
+  normal run does not create `%APPDATA%\hex\logs`.
+- `.github/workflows/build.yml` builds twice on `windows-latest`, requires the
+  two hashes to match, runs `hex.exe version`, and uploads the exe. The native
+  shim is a separate local build and is not part of default CI.
+- The tracked tree is the source needed to build the app. Models, `bin/`, local
+  toolchains, the native `transcribe.cpp` checkout and the maintainer's
+  `build.ps1` are not tracked.
+
 | Piece | State |
 |---|---|
+| Clean-clone app build | working — pinned Odin, checked-in icon resource, reproducible |
 | ASR engine in Odin: GGUF reader, mel frontend, conformer encoder, TDT decoder | working, parity with ggml |
 | Q8_0 / F16 / F32 kernels (AVX2 + FMA) | working, tuned for 4C/8T Zen 2 |
-| CLI (`devices`, `record`, `transcribe`, `models`, `status`, `engine`, `threads`, `paste`, `app`) | working |
+| CLI (`devices`, `record`, `transcribe`, `models`, `status`, `engine`, `threads`, `log`, `paste`, `app`) | working |
 | Capture via miniaudio (WASAPI) → mono f32 16 kHz → WAV, 2-minute ring | working |
 | HUD: Rune's **Dot scope** — the real `Scope`/`Indicator` simulation plus a CPU port of `rune_hud.wgsl`'s fragment path (112x26 pt plate, 43x9 dots @2.6 pt, shadow/rim/glow, braid/processing/done) | working |
 | Global hotkeys `Ctrl+Space` dictate, `Ctrl+Alt+Q` quit; Esc cancels a recording or a transcription | working |
