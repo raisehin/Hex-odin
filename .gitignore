@@ -1,6 +1,6 @@
 # =============================================================================
 # What this repo ships: the sources needed to build hex.exe.
-#   src/                     Odin app (13 files)
+#   src/                     Odin app (17 files)
 #   native/CMakeLists.txt    + transcribe_shim.{cpp,h}
 #   build.ps1                + scripts/make-icon.py (regenerates hex.res)
 #   Hex.png                  icon source
@@ -69,6 +69,13 @@ cmake_install.cmake
 /vendor_src/
 
 # Local research scaffolding -------------------------------------------------
+# Upstream ggml diff tree (AGENTS.md used to call this ignored; make it so).
+/.upstream-ggml/
+# Local agent notes, not part of the shipped build.
+/AGENTS.md
+# Local scratch/parity area. This was only in .git/info/exclude, which does not
+# travel with a clone, so keep a copy in the repository policy too.
+/.sandbox/
 # Unreferenced D3D12 tiled-GEMM shader draft: not built by build_shaders.ps1
 # and not loaded by anything, kept locally only.
 /phonon/d3d12/q8_0_gemm_tiled.hlsl
