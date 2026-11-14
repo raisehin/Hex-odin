@@ -162,7 +162,9 @@ sha256_file :: proc(path: string) -> string {
 }
 
 run_capture :: proc(argv: []string, out: ^[dynamic]u8) -> bool {
-	tmp := "C:/Windows/Temp/hex-capture.txt"
+	tmp_dir, _ := os.temp_directory(context.temp_allocator)
+	if len(tmp_dir) == 0 { tmp_dir = "." }
+	tmp := fmt.aprintf("%s/hex-capture-%d.txt", tmp_dir, os.get_pid())
 	parts := make([dynamic]string, context.temp_allocator)
 	append(&parts, "cmd.exe", "/c")
 	joined := strings.join(argv, " ")

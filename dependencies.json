@@ -1,0 +1,11 @@
+{
+  "odin": {
+    "release": "dev-2026-10",
+    "url": "https://github.com/odin-lang/Odin/releases/download/dev-2026-10/odin-windows-amd64-dev-2026-10.zip",
+    "sha256": "b6b2e426a8b6f147b74ec7e18bef8df27cf40fe16193159df7ca09a0cc0c2011"
+  },
+  "transcribe_cpp": {
+    "repository": "https://github.com/anomalyco/transcribe.cpp",
+    "revision": "7045d1c0fe7cee37747b2792977421d435e75fca"
+  }
+}

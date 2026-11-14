@@ -20,7 +20,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 AR="$ROOT/.swarm/ar"
 BUILD="$AR/build"
-ODIN="C:/Users/rhais/Documents/odin-windows-amd64-dev-2026-10/dist/odin.exe"
+ODIN="${HEX_ODIN:-${ODIN:-odin}}"
 WAV="$ROOT/bench-kernels/Hello there.wav"
 MODEL="${HEX_BENCH_MODEL:-$APPDATA/hex/models/phonon-2.5-en-Q8_0.gguf}"
 RUNS="${HEX_BENCH_RUNS:-5}"

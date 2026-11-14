@@ -19,6 +19,7 @@ Config :: struct {
 	paste_keys: string,
 	threads:    int,
 	engine:     string,
+	log:        string,
 	path:       string,
 }
 
@@ -29,6 +30,7 @@ DEFAULTS :: Config{
 	paste_keys = "ctrl_v",
 	threads = 0, // 0 = let ggml use every usable core
 	engine = "auto", // auto = built-in engine for phonon models, shim elsewhere
+	log = "off", // off | stderr | file; HEX_LOG overrides for a single run
 }
 
 // config_load is called by log_write on every log line, so it must not allocate
@@ -96,6 +98,10 @@ config_load :: proc() -> Config {
 				switch val {
 				case "auto", "shim", "phonon", "odin": cfg.engine = strings.clone(val)
 				}
+			case "log":
+				switch val {
+				case "off", "stderr", "file": cfg.log = strings.clone(val)
+				}
 			}
 		}
 	}
@@ -111,7 +117,7 @@ config_load :: proc() -> Config {
 
 config_save :: proc(cfg: ^Config) -> bool {
 	os.make_directory(cfg.data_dir)
-	text := fmt.aprintf("model=%s\nlanguage=%s\nshortcut=%s\npaste_keys=%s\nthreads=%d\nengine=%s\n", cfg.model, cfg.language, cfg.shortcut, cfg.paste_keys, cfg.threads, cfg.engine)
+	text := fmt.aprintf("model=%s\nlanguage=%s\nshortcut=%s\npaste_keys=%s\nthreads=%d\nengine=%s\nlog=%s\n", cfg.model, cfg.language, cfg.shortcut, cfg.paste_keys, cfg.threads, cfg.engine, cfg.log)
 	ok := os.write_entire_file(cfg.path, text) == nil
 	if ok {
 		sync.lock(&config_lock)

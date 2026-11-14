@@ -17,18 +17,21 @@ param(
     [switch]$Install,
     [ValidateSet("en", "multi")]
     [string]$Variant = "en",
-    [string]$Quant = "Q8_0"
+    [string]$Quant = "Q8_0",
+    [string]$InstallDir = (Join-Path $env:APPDATA "hex\models")
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = "$PSScriptRoot\.."
-$src = "$repoRoot\native\third_party\transcribe.cpp"
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$src = Join-Path $repoRoot "native\third_party\transcribe.cpp"
 $slug = if ($Variant -eq "multi") { "phonon-2.5" } else { "phonon-2.5-en" }
-$outDir = "$repoRoot\native\models\$slug"
+$outDir = Join-Path $repoRoot "native\models\$slug"
 $f32 = Join-Path $outDir "$slug-F32.gguf"
 
-if (-not (Test-Path "$src\scripts\convert-parakeet.py")) {
-    throw "transcribe.cpp checkout missing at $src (clone it first)"
+if (-not (Test-Path (Join-Path $src "scripts\convert-parakeet.py"))) {
+    Write-Host "transcribe.cpp checkout missing at $src; fetching pinned revision..." -ForegroundColor Cyan
+    & (Join-Path $PSScriptRoot "fetch-transcribe.ps1") -Destination $src
+    if ($LASTEXITCODE -ne 0) { throw "fetch-transcribe.ps1 failed" }
 }
 
 # 1. Converter dependencies.
@@ -45,17 +48,18 @@ if (-not (Test-Path $f32)) {
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
     Write-Host "converting Phonon-2.5 ($Variant) -> $f32" -ForegroundColor Cyan
     $env:PYTHONUTF8 = "1"
-    python "$repoRoot\scripts\convert-phonon25.py" --variant $Variant
+    python (Join-Path $PSScriptRoot "convert-phonon25.py") --variant $Variant
     if ($LASTEXITCODE -ne 0) { throw "convert-phonon25.py failed" }
 }
 
 # 3. Quantize with transcribe.cpp's own tool so the format matches the engine.
-$quantize = "$repoRoot\native\build-transcribe\bin\Release\transcribe-quantize.exe"
+$quantize = Join-Path $repoRoot "native\build-transcribe\bin\Release\transcribe-quantize.exe"
 if (-not (Test-Path $quantize)) {
     Write-Host "building transcribe-quantize..." -ForegroundColor Cyan
-    cmake -S "$src" -B "$repoRoot\native\build-transcribe" -DCMAKE_BUILD_TYPE=Release `
+    $buildDir = Join-Path $repoRoot "native\build-transcribe"
+    cmake -S $src -B $buildDir -DCMAKE_BUILD_TYPE=Release `
           -DGGML_VULKAN=OFF -DTRANSCRIBE_BUILD_TOOLS=ON | Out-Null
-    cmake --build "$repoRoot\native\build-transcribe" --config Release --target transcribe-quantize | Out-Null
+    cmake --build $buildDir --config Release --target transcribe-quantize | Out-Null
 }
 
 $out = Join-Path $outDir ("$slug-" + $Quant + ".gguf")
@@ -64,10 +68,9 @@ Write-Host "quantizing -> $out" -ForegroundColor Cyan
 if ($LASTEXITCODE -ne 0) { throw "transcribe-quantize failed" }
 
 if ($Install) {
-    $models = Join-Path $env:APPDATA "hex\models"
-    New-Item -ItemType Directory -Force -Path $models | Out-Null
-    Copy-Item $out (Join-Path $models (Split-Path $out -Leaf)) -Force
-    Write-Host "installed into $models" -ForegroundColor Green
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    Copy-Item $out (Join-Path $InstallDir (Split-Path $out -Leaf)) -Force
+    Write-Host "installed into $InstallDir" -ForegroundColor Green
     Write-Host "run: .\bin\hex.exe models list | findstr phonon"
 }
 

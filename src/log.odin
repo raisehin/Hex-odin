@@ -21,10 +21,13 @@ import "core:sys/windows"
 // fills, when 500 ms have passed, or when log_flush is called (every dictation
 // finishes with one, so nothing a user would read after an ordinary run is
 // lost). Only a hard crash can drop the last unflushed lines.
+Log_Mode :: enum { off, stderr, file }
+
 log_lock: sync.Mutex
 log_path: string
 log_file: ^os.File
 log_ready: bool
+log_mode: Log_Mode
 BACKLOG :: 8 * 1024
 log_backlog: [BACKLOG]u8
 log_backlog_len: int
@@ -37,6 +40,35 @@ log_mirror_known: bool
 // Reused across lines so formatting a log line does not allocate at all.
 log_msg_buf: strings.Builder
 log_line_buf: strings.Builder
+
+log_mode_parse :: proc(name: string) -> (Log_Mode, bool) {
+	switch name {
+	case "off":    return .off, true
+	case "stderr": return .stderr, true
+	case "file":   return .file, true
+	}
+	return .off, false
+}
+
+log_mode_name :: proc(mode: Log_Mode) -> string {
+	switch mode {
+	case .off:    return "off"
+	case .stderr: return "stderr"
+	case .file:   return "file"
+	}
+	return "off"
+}
+
+// HEX_LOG wins for one process, then the config's `log=` setting. No value
+// means off: a normal run must not create or append a persistent log.
+log_resolve_mode :: proc() -> Log_Mode {
+	if value := os.get_env("HEX_LOG", context.temp_allocator); len(value) > 0 {
+		if mode, ok := log_mode_parse(value); ok { return mode }
+	}
+	cfg := config_load()
+	if mode, ok := log_mode_parse(cfg.log); ok { return mode }
+	return .off
+}
 
 // "[YYYY-MM-DD HH:MM:SS] " with the same zero padding the format string used.
 log_write_stamp :: proc(b: ^strings.Builder, st: windows.SYSTEMTIME) {
@@ -77,7 +109,11 @@ log_write_u32 :: proc(b: ^strings.Builder, v: u32, width: int) {
 }
 
 log_flush_unlocked :: proc() {
-	if log_backlog_len == 0 { return }
+	if log_mode != .file || log_backlog_len == 0 {
+		log_backlog_len = 0
+		log_pending_since = {}
+		return
+	}
 	if log_file == nil {
 		if f, err := os.open(log_path, {.Append, .Create}); err == nil { log_file = f }
 	}
@@ -102,15 +138,19 @@ log_write :: proc(format: string, args: ..any) {
 	defer sync.unlock(&log_lock)
 
 	if !log_ready {
-		cfg := config_load()
-		os.make_directory(cfg.data_dir)
-		os.make_directory(cfg.logs_dir)
-		log_path = strings.concatenate({cfg.logs_dir, "/odin.log"})
+		log_mode = log_resolve_mode()
+		if log_mode == .file {
+			cfg := config_load()
+			os.make_directory(cfg.data_dir)
+			os.make_directory(cfg.logs_dir)
+			log_path = strings.concatenate({cfg.logs_dir, "/odin.log"})
+		}
 		log_ready = true
 	}
+	if log_mode == .off { return }
 	if !log_mirror_known {
 		log_mirror_known = true
-		h := windows.GetStdHandle(windows.STD_OUTPUT_HANDLE)
+		h := windows.GetStdHandle(windows.STD_ERROR_HANDLE)
 		mode: u32
 		log_mirror = h != windows.INVALID_HANDLE_VALUE && bool(windows.GetConsoleMode(h, &mode))
 	}
@@ -133,6 +173,10 @@ log_write :: proc(format: string, args: ..any) {
 	strings.write_string(&log_line_buf, msg)
 	strings.write_byte(&log_line_buf, '\n')
 	line := strings.to_string(log_line_buf)
+	if log_mode == .stderr {
+		fmt.eprint(line)
+		return
+	}
 	// The terminal mirror is one write per line, not two: the newline goes into
 	// the same buffer, so the round trip to the console costs one syscall.
 	strings.write_byte(&log_msg_buf, '\n')
@@ -151,7 +195,7 @@ log_write :: proc(format: string, args: ..any) {
 					log_file = nil
 				}
 			}
-			if log_mirror { fmt.print(mirror) }
+			if log_mirror { fmt.eprint(mirror) }
 			return
 		}
 	}
@@ -162,5 +206,5 @@ log_write :: proc(format: string, args: ..any) {
 	   time.duration_milliseconds(time.since(log_pending_since)) >= 500 {
 		log_flush_unlocked()
 	}
-	if log_mirror { fmt.print(mirror) }
+	if log_mirror { fmt.eprint(mirror) }
 }

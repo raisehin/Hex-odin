@@ -183,16 +183,14 @@ nothing while you are not using it.
 ## Build
 
 ```powershell
-# Odin app (~5 s): bin\hex.exe
-.\build.ps1                 # debug
-.\build.ps1 -Release
+# Odin app (~5 s): bin\hex.exe. This is the only required build step.
+.uild.ps1                 # debug
+.uild.ps1 -Release
 
-# Heavy half, built once: ggml + transcribe.cpp (CPU backend, no Vulkan SDK)
-cmake -S native/third_party/transcribe.cpp -B native/build-transcribe -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=OFF
-cmake --build native/build-transcribe --config Release --parallel
-
-# Shim, linked against those static libs, copied next to the exe in bin\
-.\build.ps1 -Release -Native
+# Optional native shim. It fetches the pinned transcribe.cpp revision when
+# native/third_party/transcribe.cpp is absent.
+.\scriptsuild-native.ps1
+# equivalent: .uild.ps1 -Release -Native
 ```
 
 `bin\hex.exe` runs without the shim — that is the built-in engine; `-Native`
@@ -201,16 +199,31 @@ only adds the reference/other-family path. Vulkan is a flag away
 is the default. If `native/build-transcribe/.../transcribe.lib` is missing the
 shim builds as a stub, so the app stays runnable.
 
-`build.ps1` is location-agnostic: it resolves everything from `$PSScriptRoot`,
-so it builds wherever the tree sits and from whatever directory you call it.
-It finds the Odin compiler from `-Odin <path>`, then `$env:ODIN` (exe or
-directory), then `PATH`, then the usual install directories (`<dir>\dist\odin.exe`,
-as release archives unpack); `rc.exe` and `python` are discovered the same way
-and either may be absent (an existing `bin\hex.res` is reused, or the exe is
-built iconless). Everything it emits — the exe, its PDB, the icon intermediates
-and the shim DLL — lands in `bin\`, which `.gitignore` covers. Any Odin dev
-build from 2026-10 or later works; that is the one this was measured with.
+`dependencies.json` pins the Odin release (URL + SHA-256) and the
+transcribe.cpp revision. `scripts/fetch-transcribe.ps1` fetches that exact
+revision; `scripts/build-native.ps1` passes
+`-DHEX_FETCH_TRANSCRIBE=ON -DTRANSCRIBE_REV=<manifest revision>` when the
+checkout is absent. The app build and the native shim build stay separate; the
+default CI job only runs `build.ps1 -Release`.
 
+`build.ps1` is location-agnostic: it resolves everything from `$PSScriptRoot`
+and finds the Odin compiler from `-Odin <path>`, then `$env:ODIN` (exe or
+directory), then `PATH`, then the usual install directories. `rc.exe` and
+`python` are discovered the same way and either may be absent (an existing
+`bin\hex.res` is reused, or the exe is built iconless). `-Microarch` /
+`HEX_MICROARCH` overrides the compiler target; CI uses `x86-64` so the artifact
+hash is reproducible rather than host-specific. Everything emitted — the exe,
+its PDB, the icon intermediates and the shim DLL — lands in `bin\`, which
+`.gitignore` covers.
+
+`.github/workflows/build.yml` is the clean-room verifier: it verifies the pinned
+Odin archive SHA-256, runs `build.ps1 -Release`, runs `hex.exe version`, hashes
+the artifact, and has a separate opt-in `workflow_dispatch` job for the native
+shim (`HEX_FETCH_TRANSCRIBE=ON`).
+
+Logging defaults to `off`, so a normal run does not create
+`%APPDATA%\hex\logs`. Use `hex log file` (or `HEX_LOG=file`) for persistent
+logs; `hex log stderr` / `HEX_LOG=stderr` keeps diagnostics on the console.
 ## Benchmarks
 
 Two harnesses, both one fresh process per measurement, both against the local

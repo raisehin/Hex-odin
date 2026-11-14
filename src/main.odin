@@ -44,6 +44,8 @@ main :: proc() {
 		time.sleep(700 * time.Millisecond)
 	case "engine":
 		cmd_engine(args[2:])
+	case "log":
+		cmd_log(args[2:])
 	case "threads":
 		cmd_threads(args[2:])
 	case "vad":
@@ -86,6 +88,26 @@ cmd_paste :: proc(args: []string) {
 	cfg.paste_keys = strings.clone(mode)
 	if !config_save(&cfg) { fmt.eprintln("could not save config"); os.exit(1) }
 	fmt.println("paste:", mode)
+}
+
+LOG_MODES :: [?]string{"off", "stderr", "file"}
+
+cmd_log :: proc(args: []string) {
+	cfg := config_load()
+	if len(args) < 1 {
+		fmt.println(log_mode_name(log_resolve_mode()))
+		return
+	}
+	mode := args[0]
+	valid := false
+	for m in LOG_MODES { if m == mode { valid = true } }
+	if !valid {
+		fmt.eprintln("usage: hex log off|stderr|file")
+		os.exit(2)
+	}
+	cfg.log = strings.clone(mode)
+	if !config_save(&cfg) { fmt.eprintln("could not save config"); os.exit(1) }
+	fmt.println("log:", mode)
 }
 
 cmd_threads :: proc(args: []string) {
@@ -164,7 +186,7 @@ usage :: proc() {
 	fmt.println(`hex — local dictation (Odin core + Odin UI)
 
   hex                     (no arguments) start the dictation host, like a double-click
-  hex app                 same, explicitly (keeps the console for logs)
+  hex app                 same, explicitly (keeps the console for diagnostics)
 
 While dictating: Ctrl+Space toggles, Esc discards the recording or cancels the
 in-flight transcription so nothing is pasted.
@@ -177,6 +199,7 @@ in-flight transcription so nothing is pasted.
   hex threads [n]         cap inference CPU workers (0 = all cores)
   hex engine [mode]       auto | phonon (built-in kernels) | shim (transcribe.cpp)
   hex paste [mode]        ctrl_v | ctrl_shift_v | shift_insert | type
+  hex log [mode]          off (default) | stderr | file  (HEX_LOG overrides)
   hex devices             list capture endpoints and compute backends
   hex models [list|install <id>|check <id>]
   hex status              resolved settings and paths
@@ -194,6 +217,7 @@ cmd_status :: proc() {
 	fmt.println("paste    :", cfg.paste_keys)
 	if cfg.threads == 0 { fmt.println("threads  : auto") } else { fmt.println("threads  :", cfg.threads) }
 	fmt.println("engine   :", engine_name(asr_backend_for(cfg.model)))
+	fmt.println("log      :", log_mode_name(log_resolve_mode()))
 	fmt.println("setting  :", asr_engine_setting())
 	if transcribe_available() {
 		v := shim.version != nil ? string(shim.version()) : "?"

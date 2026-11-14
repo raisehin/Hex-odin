@@ -112,7 +112,10 @@ try {
     # with their own target features, but the loops around them (mel, norms,
     # softmax) only vectorise when the build targets the host. Odin's default is
     # x86-64/SSE2; the encoder is 444 ms at that target against 326 ms at znver2.
-    $flags = @(if ($Release) { "-o:speed" } else { "-debug" }) + "-microarch:native"
+    $arch = if ($Microarch) { $Microarch } else { "native" }
+    # /Brepro removes the PE timestamp so two clean builds of the same sources
+    # and target produce the same SHA-256 (CI compares its artifact hash).
+    $flags = @(if ($Release) { "-o:speed" } else { "-debug" }) + "-microarch:$arch" + "-extra-linker-flags:/Brepro"
 
     # App icon: Hex.png -> bin\hex.ico + bin\hex.rc (scripts/make-icon.py) ->
     # bin\hex.res (rc.exe) -> linked into the exe. The .res is what makes
@@ -156,21 +159,12 @@ try {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     if ($Native) {
-        $cmake = Get-Command cmake -ErrorAction SilentlyContinue
-        if (-not $cmake) { throw "-Native needs cmake on PATH" }
-        # cmake and MSBuild write ordinary warnings to stderr. With
-        # $ErrorActionPreference = 'Stop' PowerShell turns each one into a
-        # NativeCommandError and aborts a build that actually succeeded, so
-        # relax it here and gate on the exit code alone.
-        $ErrorActionPreference = 'Continue'
-        try {
-            & $cmake.Source -S native -B native/build -DCMAKE_BUILD_TYPE=Release
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            & $cmake.Source --build native/build --config Release
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        } finally {
-            $ErrorActionPreference = 'Stop'
-        }
+        # Keep the optional shim on the same explicit dependency path as CI:
+        # build-native.ps1 passes HEX_FETCH_TRANSCRIBE=ON and the revision from
+        # dependencies.json when native/third_party is absent.
+        $nativeScript = Join-Path $root 'scripts\build-native.ps1'
+        & $nativeScript
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 
     # The app loads the shim from its own directory first (src/transcribe.odin).
