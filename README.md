@@ -1,7 +1,7 @@
 # hex (Odin)
 
 Hex's dictation core in plain Odin: capture, the Dot-scope overlay, hotkeys,
-clipboard paste — and, since this branch, the speech recogniser too.
+clipboard paste — and the speech recogniser too.
 
 `phonon/` is a hand-written inference engine for **Phonon-2.5 English**
 (Fermion Research, 0.6B TDT / Parakeet family): it reads the shipped
@@ -182,48 +182,51 @@ nothing while you are not using it.
 
 ## Build
 
-```powershell
-# Odin app (~5 s): bin\hex.exe. This is the only required build step.
-.uild.ps1                 # debug
-.uild.ps1 -Release
+Requirements: Windows x64 and the Odin release pinned in `dependencies.json`.
+The app build needs no model, Python, CMake, native shim, or local toolchain.
 
-# Optional native shim. It fetches the pinned transcribe.cpp revision when
-# native/third_party/transcribe.cpp is absent.
-.\scriptsuild-native.ps1
-# equivalent: .uild.ps1 -Release -Native
+```powershell
+# Reproducible app-only build used by CI: bin\hex.exe.
+.\scripts\build-ci.ps1
+.\bin\hex.exe version
 ```
 
-`bin\hex.exe` runs without the shim — that is the built-in engine; `-Native`
-only adds the reference/other-family path. Vulkan is a flag away
-(`-DGGML_VULKAN=ON`) but needs the Vulkan SDK, which is not installed here; CPU
-is the default. If `native/build-transcribe/.../transcribe.lib` is missing the
-shim builds as a stub, so the app stays runnable.
+`scripts/build-ci.ps1` resolves the repo from `$PSScriptRoot`, finds Odin from
+`-Odin <path>`, `$env:ODIN` (exe or directory), then `odin` on `PATH`, and links
+the checked-in `assets\hex.res` icon generated from `Hex.png`. It uses
+`-o:speed -microarch:x86-64`, `/Brepro`, and `-source-code-locations:none`, so
+two clean builds produce the same SHA-256. `-Microarch` or `HEX_MICROARCH` can
+override the target.
+
+The maintainer's `build.ps1` is local-only and ignored by git. It additionally
+regenerates the icon intermediates when Python/Pillow and `rc.exe` are present;
+that convenience is not a CI dependency. To refresh the checked-in icon, run
+`python scripts/make-icon.py`, then from `bin\` run
+`rc /nologo /fo hex.res hex.rc` and copy `bin\hex.res` to `assets\hex.res`.
+
+The optional native transcribe shim is a separate build and is not part of the
+default CI job:
+
+```powershell
+.\scripts\build-native.ps1
+```
 
 `dependencies.json` pins the Odin release (URL + SHA-256) and the
 transcribe.cpp revision. `scripts/fetch-transcribe.ps1` fetches that exact
 revision; `scripts/build-native.ps1` passes
 `-DHEX_FETCH_TRANSCRIBE=ON -DTRANSCRIBE_REV=<manifest revision>` when the
-checkout is absent. The app build and the native shim build stay separate; the
-default CI job only runs `build.ps1 -Release`.
+checkout is absent.
 
-`build.ps1` is location-agnostic: it resolves everything from `$PSScriptRoot`
-and finds the Odin compiler from `-Odin <path>`, then `$env:ODIN` (exe or
-directory), then `PATH`, then the usual install directories. `rc.exe` and
-`python` are discovered the same way and either may be absent (an existing
-`bin\hex.res` is reused, or the exe is built iconless). `-Microarch` /
-`HEX_MICROARCH` overrides the compiler target; CI uses `x86-64` so the artifact
-hash is reproducible rather than host-specific. Everything emitted — the exe,
-its PDB, the icon intermediates and the shim DLL — lands in `bin\`, which
-`.gitignore` covers.
-
-`.github/workflows/build.yml` is the clean-room verifier: it verifies the pinned
-Odin archive SHA-256, runs `build.ps1 -Release`, runs `hex.exe version`, hashes
-the artifact, and has a separate opt-in `workflow_dispatch` job for the native
-shim (`HEX_FETCH_TRANSCRIBE=ON`).
+`.github/workflows/build.yml` is the clean-room verifier for `main`: it
+installs and SHA-256-checks the pinned Odin archive, runs
+`scripts/build-ci.ps1` twice and requires identical hashes, runs
+`hex.exe version`, writes `bin\hex.exe.sha256`, checks that the tracked tree
+stayed clean and that `build.ps1` is ignored, then uploads the exe and digest.
 
 Logging defaults to `off`, so a normal run does not create
 `%APPDATA%\hex\logs`. Use `hex log file` (or `HEX_LOG=file`) for persistent
 logs; `hex log stderr` / `HEX_LOG=stderr` keeps diagnostics on the console.
+
 ## Benchmarks
 
 Two harnesses, both one fresh process per measurement, both against the local

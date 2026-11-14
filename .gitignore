@@ -2,7 +2,8 @@
 # What this repo ships: the sources needed to build hex.exe.
 #   src/                     Odin app (17 files)
 #   native/CMakeLists.txt    + transcribe_shim.{cpp,h}
-#   build.ps1                + scripts/make-icon.py (regenerates hex.res)
+#   scripts/build-ci.ps1     reproducible app build used by CI
+#   assets/hex.res           icon resource generated from Hex.png
 #   Hex.png                  icon source
 #   README.md
 # Everything else is local scaffolding: ports, benchmarks, probes, captures,
@@ -10,8 +11,10 @@
 # =============================================================================
 
 # Build output ---------------------------------------------------------------
-# build.ps1 writes the exe, its PDB, the icon intermediates and the shim here.
+# build scripts write the exe, its PDB, the icon intermediates and the shim here.
 /bin/
+# The maintainer's local build script; CI uses scripts/build-ci.ps1.
+/build.ps1
 *.exe
 *.pdb
 *.o
@@ -26,6 +29,8 @@
 *.ll
 *.map
 *.res
+# Checked-in, reproducible icon resource linked by scripts/build-ci.ps1.
+!/assets/hex.res
 *.bin
 
 # Native shim and cmake trees (built by scripts/build-native.ps1) ------------

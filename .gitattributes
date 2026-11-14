@@ -3,3 +3,4 @@
 # CI artifact hash comparable to a clean local build.
 *.odin text eol=lf
 *.sh text eol=lf
+*.res binary

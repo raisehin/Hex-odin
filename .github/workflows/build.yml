@@ -2,13 +2,9 @@ name: build
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
-    inputs:
-      native_shim:
-        description: Also build the optional native transcribe shim
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -17,8 +13,6 @@ jobs:
   app:
     name: Odin app clean-room
     runs-on: windows-latest
-    env:
-      HEX_MICROARCH: x86-64
     steps:
       - uses: actions/checkout@v4
 
@@ -40,9 +34,24 @@ jobs:
           Split-Path -Parent $odin.FullName >> $env:GITHUB_PATH
 
       - name: Build app
-        run: .\build.ps1 -Release
+        shell: pwsh
+        run: .\scripts\build-ci.ps1
+
+      - name: Verify a second clean build
+        shell: pwsh
+        run: |
+          $first = (Get-FileHash -Algorithm SHA256 bin\hex.exe).Hash.ToLowerInvariant()
+          Remove-Item -Recurse -Force bin
+          .\scripts\build-ci.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $second = (Get-FileHash -Algorithm SHA256 bin\hex.exe).Hash.ToLowerInvariant()
+          if ($first -ne $second) {
+            throw "clean rebuild mismatch: first=$first second=$second"
+          }
+          "Reproducible hex.exe SHA-256: $second" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Run version
+        shell: pwsh
         run: .\bin\hex.exe version
 
       - name: Hash app
@@ -51,9 +60,10 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 bin\hex.exe).Hash.ToLowerInvariant()
           "hex.exe SHA-256: $hash"
           "HEX_EXE_SHA256=$hash" >> $env:GITHUB_ENV
+          "hex.exe SHA-256: $hash" >> $env:GITHUB_STEP_SUMMARY
           Set-Content -Path bin\hex.exe.sha256 -Value "$hash  hex.exe"
 
-      - name: Assert no tracked output
+      - name: Assert clean tracked tree and local-only build.ps1
         shell: pwsh
         run: |
           $status = git status --porcelain
@@ -62,34 +72,25 @@ jobs:
             throw 'build dirtied the tracked tree'
           }
 
+          git check-ignore -v build.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'build.ps1 is not ignored' }
+          if (git ls-files build.ps1) { throw 'build.ps1 must not be tracked' }
+
+          $tracked = git ls-tree -r --name-only HEAD
+          $forbidden = $tracked | Select-String -Pattern '^(bin/|\.sandbox/|\.upstream-ggml/|toolchains/)'
+          if ($forbidden) {
+            $forbidden
+            throw 'generated or local-only trees are tracked'
+          }
+          foreach ($required in @('Hex.png', 'assets/hex.res', 'scripts/build-ci.ps1', '.github/workflows/build.yml')) {
+            if (-not ($tracked -contains $required)) {
+              throw "required tracked file is missing: $required"
+            }
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: hex-exe
           path: |
             bin/hex.exe
             bin/hex.exe.sha256
-
-  native-shim:
-    name: Optional native shim clean-room
-    if: github.event_name == 'workflow_dispatch' && inputs.native_shim
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build pinned transcribe.cpp shim
-        shell: pwsh
-        run: |
-          $manifest = Get-Content -Raw dependencies.json | ConvertFrom-Json
-          $rev = $manifest.transcribe_cpp.revision
-          cmake -S native -B native/build `
-            -DHEX_FETCH_TRANSCRIBE=ON `
-            -DTRANSCRIBE_REV=$rev `
-            -DCMAKE_BUILD_TYPE=Release
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build native/build --config Release
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: transcribe-shim
-          path: native/bin/transcribe_shim.dll
