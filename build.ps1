@@ -116,6 +116,9 @@ try {
     # /Brepro removes the PE timestamp so two clean builds of the same sources
     # and target produce the same SHA-256 (CI compares its artifact hash).
     $flags = @(if ($Release) { "-o:speed" } else { "-debug" }) + "-microarch:$arch" + "-extra-linker-flags:/Brepro"
+    # Release binaries also drop source paths, so the same inputs produce the
+    # same bytes from different checkout directories.
+    if ($Release) { $flags += "-source-code-locations:none" }
 
     # App icon: Hex.png -> bin\hex.ico + bin\hex.rc (scripts/make-icon.py) ->
     # bin\hex.res (rc.exe) -> linked into the exe. The .res is what makes
