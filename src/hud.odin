@@ -2,7 +2,6 @@ package main
 
 import "base:runtime"
 import "core:fmt"
-import "core:math"
 import "core:os"
 import "core:strings"
 import "core:sync"
@@ -21,11 +20,6 @@ MOD_CONTROL :: 0x0002
 
 WINDOW_W :: 304 // pt, matches Hex's non-macOS HUD window
 WINDOW_H :: 80
-PLATE_W :: 112.0
-PLATE_H :: 26.0
-PLATE_RADIUS :: 13.0
-COLUMNS :: 43
-ROWS :: 9
 PITCH :: 2.6
 
 BLENDFUNCTION :: struct {
@@ -68,20 +62,14 @@ foreign kernel32 {
 	GetConsoleWindow :: proc() -> windows.HWND ---
 }
 
-Vec3 :: [3]f32
-
 Hud :: struct {
 	hwnd:      windows.HWND,
 	mem_dc:    windows.HDC,
 	bitmap:    windows.HBITMAP,
 	pixels:    []u32, // DIB, the size Windows composites
-	hi:        []u32, // supersampled frame
 	w:         int,
 	h:         int,
 	scale:     f32,
-	level:     f32, // smoothed rms, 0..1
-	cool:      f32, // 0 listening (warm), 1 processing (blue)
-	peak:      f32,
 	recording:  bool,
 	capture_up: bool,
 	busy:       bool,
@@ -89,21 +77,18 @@ Hud :: struct {
 	state_lock:  sync.Mutex,
 	buffer_lock: sync.Mutex,
 
-	base:      []u32, // baked plate + rim + shadow
-	cover:     []u8,  // baked plate coverage, for the live glow pass
-	dist:      []f32, // baked distance from the plate centre
 	timer_on:  bool,
 	visible:   bool,
-
-	phase:     f32, // braid travel
 	reveal:    f32, // 0 hidden .. 1 shown
-	power:     [COLUMNS * ROWS]f32,
-	fresh:     [COLUMNS * ROWS]f32,
-	cell_mask: [COLUMNS * ROWS]f32, // baked plate mask per dot, scale-bound
-	mask_scale: f32,                // hud.scale the mask was baked for
 	buffer:    ^[dynamic]f32,
 	last:      time.Time,
 	ready:     time.Time,
+	scope_ind:  ^Indicator,
+	scope_origin: time.Tick,
+	scope_last: f64,
+	was_busy:   bool,
+	cap_level:  Capture_Level,
+	level_debug_last: f64,
 }
 
 hud: Hud
@@ -191,6 +176,9 @@ app_run :: proc(cfg: ^Config) {
 	hud.scale = 1.0
 	if dpi := f32(GetDpiForWindow(h)); dpi >= 96 { hud.scale = dpi / 96.0 }
 	hud_setup_dib()
+	hud.scope_ind = indicator_new(tuning_default())
+	hud.scope_origin = time.tick_now()
+	hud.scope_last = 0
 	hud.reveal = 0
 	hud.last = time.now()
 
@@ -317,15 +305,9 @@ wnd_proc :: proc "system" (hwnd: windows.HWND, msg: windows.UINT, wparam: window
 	return windows.DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-SUPERSAMPLE :: 2
-// Column block of the splat coverage table: columns are tabulated once per
-// block so the inner loop only adds and compares.
-SPLAT_BLOCK :: 64
-
 hud_setup_dib :: proc() {
 	hud.w = int(f32(WINDOW_W) * hud.scale)
 	hud.h = int(f32(WINDOW_H) * hud.scale)
-	hud.hi = make([]u32, hud.w * SUPERSAMPLE * hud.h * SUPERSAMPLE)
 
 	bi: windows.BITMAPINFO
 	bi.bmiHeader.biSize = size_of(windows.BITMAPINFOHEADER)
@@ -347,12 +329,6 @@ hud_setup_dib :: proc() {
 	windows.SelectObject(hud.mem_dc, windows.HGDIOBJ(hud.bitmap))
 	p32 := cast([^]u32)bits
 	hud.pixels = p32[0:hud.w * hud.h]
-
-	n := hud.w * SUPERSAMPLE * hud.h * SUPERSAMPLE
-	hud.base = make([]u32, n)
-	hud.cover = make([]u8, n)
-	hud.dist = make([]f32, n)
-	hud_build_base()
 }
 
 HUD_TIMER_MS :: 42 // 24 fps; the braid does not need more and this is the
@@ -389,11 +365,16 @@ hud_toggle :: proc() {
 		sync.lock(&hud.buffer_lock)
 		if hud.buffer == nil { hud.buffer = new([dynamic]f32) }
 		clear(&hud.buffer^)
+		hud.cap_level = {}
 		sync.unlock(&hud.buffer_lock)
 		capture_discard()
 		hud_set_pump(true)
 		hud.recording = true
 		hud.reveal = 1
+		if hud.scope_ind != nil {
+			now := time.duration_seconds(time.tick_since(hud.scope_origin))
+			indicator_on_started(hud.scope_ind, now)
+		}
 		hud_timer(true)
 		power_eco(false)
 		hud_escape(true)
@@ -415,11 +396,15 @@ hud_toggle :: proc() {
 		hud.recording = false
 		hud_set_pump(false)
 		sync.lock(&hud.buffer_lock)
-		capture_pump(nil, hud.buffer, nil) // sweep the final period
+		capture_pump(nil, hud.buffer, &hud.cap_level) // sweep the final period
 		sync.unlock(&hud.buffer_lock)
 		capture_stop(nil)
 		hud.capture_up = false
 		log_write("[hex] mic released, transcribing")
+		if hud.scope_ind != nil {
+			now := time.duration_seconds(time.tick_since(hud.scope_origin))
+			indicator_on_submitted(hud.scope_ind, now)
+		}
 		hud_transcribe_async()
 	}
 }
@@ -437,7 +422,7 @@ hud_set_pump :: proc(on: bool) {
 		pump_thread = thread.create(proc(_: ^thread.Thread) {
 			for sync.atomic_load(&pump_running) != 0 {
 				sync.lock(&hud.buffer_lock)
-				if hud.buffer != nil { capture_pump(nil, hud.buffer, nil) }
+				if hud.buffer != nil { capture_pump(nil, hud.buffer, &hud.cap_level) }
 				sync.unlock(&hud.buffer_lock)
 				time.sleep(10 * time.Millisecond)
 			}
@@ -476,11 +461,23 @@ hud_cancel :: proc() {
 		hud.cancel_gen += 1
 		sync.unlock(&hud.state_lock)
 		hud_escape(false)
+		if hud.scope_ind != nil {
+			hud.scope_ind.capturing = false
+			hud.scope_ind.pending_jobs = 0
+			hud.scope_ind.completion_pending = false
+			hud.scope_ind.phase = .cancelled
+			hud.scope_ind.phase_started = time.duration_seconds(time.tick_since(hud.scope_origin))
+		}
 		log_write("[hex] cancelled recording")
 	} else if hud_is_busy() {
 		sync.lock(&hud.state_lock)
 		hud.cancel_gen += 1
 		sync.unlock(&hud.state_lock)
+		if hud.scope_ind != nil {
+			hud.scope_ind.phase = .cancelled
+			hud.scope_ind.pending_jobs = 0
+			hud.scope_ind.completion_pending = false
+		}
 		log_write("[hex] cancelling transcription")
 	}
 }
@@ -508,8 +505,8 @@ hud_cancel_generation :: proc() -> int {
 // context anyway.
 SEG_MIN_SAMPLES :: 16000 // 1 s of new speech before a slice is worth encoding
 SEG_CTX_SAMPLES :: 3200  // 200 ms of left context per slice
-SEG_POLL_MS :: 250
-SEG_SILENCE_MS :: 300    // silence that closes a segment
+SEG_POLL_MS :: 500    // poll the VAD every 500 ms
+SEG_SILENCE_MS :: 500    // silence that closes a segment
 
 seg_thread: ^thread.Thread
 seg_stop: i32
@@ -692,13 +689,17 @@ transcribe_worker :: proc(t: ^thread.Thread) {
 		for p in prefix { append(&parts, p) }
 		if len(text) > 0 { append(&parts, text) }
 		full = strings.join(parts[:], " ")
-		defer delete(full)
 	}
+	// `defer` is scope-scoped in Odin: putting this inside the if-block above
+	// freed `full` before the paste and the log line ever read it, so the
+	// clipboard received a recycled heap block (first word replaced by the
+	// allocator's free-list pointer). Delete it once both readers are done.
 	if paste_text(full) {
 		log_write("[hex] pasted %.2fs: %s", elapsed, full)
 	} else {
 		log_write("[hex] paste failed")
 	}
+	if len(prefix) > 0 { delete(full) }
 }
 
 hud_tick :: proc() {
@@ -706,39 +707,40 @@ hud_tick :: proc() {
 	dt := f32(time.duration_seconds(time.since(hud.last)))
 	if dt > 0.1 { dt = 0.1 }
 	hud.last = now
+	scope_now := time.duration_seconds(time.tick_since(hud.scope_origin))
+	scope_dt := f32(scope_now - hud.scope_last)
+	hud.scope_last = scope_now
 
-	// Level: fast attack, slow release, like the scope's reservoir.
-	target := f32(0)
+	// Level: the raw period RMS the capture pump already measured. No second
+	// derivation from the buffer, and no idle floor overriding quiet speech.
+	raw_rms := f32(0)
+	raw_peak := f32(0)
 	if hud.recording {
 		sync.lock(&hud.buffer_lock)
-		if hud.buffer != nil && len(hud.buffer^) > 0 {
-			n := min(len(hud.buffer^), 2048)
-			sum: f64
-			for i in 0 ..< n {
-				v := hud.buffer^[len(hud.buffer^) - 1 - i]
-				sum += f64(v) * f64(v)
-			}
-			rms := f32(math.sqrt(sum / f64(n)))
-			target = clamp((rms - 0.002) * 22.0, 0, 1)
-			// A quiet room still breathes: Hex's Auto level follows recent peak.
-			idle := 0.10 + 0.05 * (0.5 + 0.5 * math.sin_f32(hud.phase * 0.05))
-			target = max(target, idle)
-		}
+		raw_rms = hud.cap_level.rms
+		raw_peak = hud.cap_level.peak
 		sync.unlock(&hud.buffer_lock)
 	}
 	busy := hud_is_busy()
-	if os.get_env("HEX_DEMO", context.temp_allocator) != "" && !hud.recording {
-		target = 0.35 + 0.3 * (0.5 + 0.5 * math.sin_f32(f32(time.duration_seconds(time.since(hud.last))) * 3.0 + hud.phase * 0.06))
+
+	raw_db := loudness_dbfs(raw_rms)
+	if hud.scope_ind != nil {
+		// The indicator contract is dBFS: src/dictation/indicator.rs sends
+		// 20*log10(rms), and AutoLevel steps in dB.
+		hud.scope_ind.loudness = raw_db
+		if hud.was_busy && !busy && !hud.recording {
+			indicator_on_completed(hud.scope_ind, scope_now)
+		}
+		if hud.recording && os.get_env("HEX_LEVEL_DEBUG", context.temp_allocator) != "" &&
+		   scope_now - hud.level_debug_last >= 0.1 {
+			hud.level_debug_last = scope_now
+			auto := &hud.scope_ind.scope.auto
+			log_write("[hex] level rms=%.6f peak=%.6f dbfs=%.2f scope=%.2f auto_peak=%.2f auto_room=%.2f",
+				raw_rms, raw_peak, raw_db, hud.scope_ind.loudness,
+				auto.peak, auto.room)
+		}
 	}
-	if target > hud.level {
-		hud.level += (target - hud.level) * min(1, dt * 22)
-	} else {
-		hud.level += (target - hud.level) * min(1, dt * 6)
-	}
-	want_cool: f32 = busy ? 1 : 0
-	hud.cool += (want_cool - hud.cool) * min(1, dt * (want_cool > hud.cool ? 6 : 3))
-	if hud.level > hud.peak { hud.peak = hud.level }
-	hud.peak = max(0, hud.peak - dt * 1.6)
+	hud.was_busy = busy
 
 	// The HUD only exists while dictating: fade in on press, out after paste.
 	want_reveal: f32 = (hud.recording || busy || time.since(hud.ready) < 1200 * time.Millisecond) ? 1 : 0
@@ -757,432 +759,11 @@ hud_tick :: proc() {
 		hud.visible = true
 	}
 
-	hud_advance_dots(dt)
-	hud_render()
-	hud_resolve()
+	if hud.scope_ind != nil {
+		frame := indicator_step(hud.scope_ind, scope_now, scope_dt)
+		hud_render_scope(frame)
+	}
 	hud_blit()
-}
-
-// One frame of the braid: two travelling traces offset by half a cycle, each
-// modulated across rows by a helix, decaying like phosphor. This is the CPU
-// stand-in for dot_scope.rs's Voice simulation.
-hud_advance_dots :: proc(dt: f32) {
-	busy := hud_is_busy()
-	hud.phase += dt * 26.0
-	sigma: f32 = 2.4
-	decay := math.exp_f32(-dt * 6.5)
-
-	// The column envelope only depends on the head, the helix only on the row,
-	// so both are built once per frame instead of once per cell.
-	env: [2][COLUMNS]f32
-	for k in 0 ..< 2 {
-		head := hud.phase + f32(k) * (f32(COLUMNS) * 0.5)
-		head_mod := math.mod(head, f32(COLUMNS))
-		for i in 0 ..< COLUMNS {
-			d := math.mod(f32(i) - head_mod + f32(COLUMNS) * 1.5, f32(COLUMNS)) - f32(COLUMNS) * 0.5
-			env[k][i] = math.exp_f32(-(d * d) / (2 * sigma * sigma))
-		}
-	}
-	helix: [2][ROWS]f32
-	for k in 0 ..< 2 {
-		for j in 0 ..< ROWS {
-			helix[k][j] = 0.5 + 0.5 * f32(math.sin(f64((f32(j) - f32(ROWS-1)*0.5) * 1.6 * math.PI / f32(ROWS) + hud.phase * 0.05 + f32(k) * math.PI)))
-		}
-	}
-	energy := hud.level * 1.35
-	if busy { energy = max(energy, 0.18) }
-
-	for i in 0 ..< COLUMNS {
-		for j in 0 ..< ROWS {
-			idx := j * COLUMNS + i
-			excite: f32 = 0
-			for k in 0 ..< 2 {
-				excite = max(excite, env[k][i] * helix[k][j])
-			}
-			v := excite * energy
-			if v > 0.02 {
-				hud.fresh[idx] = 1
-			}
-			decayed := hud.power[idx] * decay
-			hud.power[idx] = clamp(max(decayed, v), 0, 1)
-			hud.fresh[idx] = max(0, hud.fresh[idx] - dt * 2.2)
-		}
-	}
-}
-
-// --- drawing ---------------------------------------------------------------
-
-plate_center :: proc() -> (x, y: f32) {
-	// Window centre, with the plate a touch above to leave room for its shadow.
-	return f32(hud.w * SUPERSAMPLE) * 0.5, f32(hud.h * SUPERSAMPLE) * 0.5 - 3.0 * hud.scale * f32(SUPERSAMPLE)
-}
-
-rounded_box :: proc(px, py, hx, hy, r: f32) -> f32 {
-	qx := abs(px) - hx + r
-	qy := abs(py) - hy + r
-	return math.sqrt_f32(max(qx, 0) * max(qx, 0) + max(qy, 0) * max(qy, 0)) + min(max(qx, qy), 0) - r
-}
-
-sstep :: proc(e0, e1, x: f32) -> f32 {
-	t := clamp((x - e0) / (e1 - e0), 0, 1)
-	return t * t * (3 - 2 * t)
-}
-
-coverage :: proc(d, softness: f32) -> f32 {
-	return sstep(softness, -softness, d)
-}
-
-mix :: proc(a, b, t: f32) -> f32 {
-	return a + (b - a) * t
-}
-
-mix3 :: proc(a, b: Vec3, t: f32) -> Vec3 {
-	return Vec3{a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t}
-}
-
-// Palette from dot_scope::palette(dark=true, cool=0, fail=0).
-PAL_YOU :: Vec3{0.86, 0.83, 0.77}
-PAL_YOU_CORE :: Vec3{0.98, 0.96, 0.92}
-PAL_AGENT :: Vec3{0.70, 0.78, 0.90}
-PAL_AGENT_CORE :: Vec3{0.92, 0.95, 1.0}
-PAL_PLATE :: Vec3{17.0 / 255.0, 17.0 / 255.0, 20.0 / 255.0}
-PAL_PLATE_A :: 0.94
-PAL_RIM_A :: 0.11
-PAL_SHADOW_A :: 0.5
-
-// Baked once: plate, rim and drop shadow never change while the HUD runs, so
-// the per-frame path only copies them and adds the two dynamic layers (glow,
-// dots). Also caches coverage and radius so the glow pass has no rounded_box
-// or sqrt in it.
-hud_build_base :: proc() {
-	px_w := hud.w * SUPERSAMPLE
-	px_h := hud.h * SUPERSAMPLE
-
-	cx, cy := plate_center()
-	scale := hud.scale * f32(SUPERSAMPLE)
-	hx := PLATE_W * 0.5 * scale
-	hy := PLATE_H * 0.5 * scale
-	radius := PLATE_RADIUS * scale
-	aa := 0.75 * scale
-
-	for y in 0 ..< px_h {
-		for x in 0 ..< px_w {
-			px := f32(x) + 0.5 - cx
-			py := f32(y) + 0.5 - cy
-			i := y*px_w + x
-
-			hud.dist[i] = math.sqrt_f32(px*px + py*py)
-			d := rounded_box(px, py, hx, hy, radius)
-			shape := coverage(d, aa)
-			hud.cover[i] = u8(clamp(shape * 255, 0, 255))
-			if shape <= 0 {
-				hud.base[i] = 0
-				continue
-			}
-
-			// shadow: same box shifted 3 pt down, blurred by tanh
-			sd := rounded_box(px, py - 3 * scale, hx, hy, radius)
-			shadow := PAL_SHADOW_A * (0.5 - 0.5 * f32(math.tanh(f64(sd / (6.5 * scale)))))
-
-			r := PAL_PLATE[0] * PAL_PLATE_A * shape
-			g := PAL_PLATE[1] * PAL_PLATE_A * shape
-			b := PAL_PLATE[2] * PAL_PLATE_A * shape
-			a := PAL_PLATE_A * shape
-
-			// drop shadow behind the plate
-			sr: f32 = 0
-			sg: f32 = 0
-			sb: f32 = 0
-			sa := shadow * (1 - shape) * 0.9
-			if sa > 0 {
-				r = sr * sa + r * (1 - sa)
-				g = sg * sa + g * (1 - sa)
-				b = sb * sa + b * (1 - sa)
-				a = sa + a * (1 - sa)
-			}
-
-			// rim: a 1 px lighter edge
-			rim := PAL_RIM_A * coverage(abs(d) - 0.3 * scale, aa)
-			if rim > 0 {
-				r = 1.0 * rim + r * (1 - rim)
-				g = 1.0 * rim + g * (1 - rim)
-				b = 1.0 * rim + b * (1 - rim)
-				a = rim + a * (1 - rim)
-			}
-
-			hud.base[i] = pack(r, g, b, a)
-		}
-	}
-}
-
-// The plate mask depends only on the dot grid and the plate scale, never on the
-// live level, so it is baked once per scale instead of re-running rounded_box
-// and its smoothstep for every dot on every frame. Same expressions, same
-// order, so the baked values are the ones the loop used to compute.
-hud_bake_cell_mask :: proc() {
-	scale := hud.scale * f32(SUPERSAMPLE)
-	hx := PLATE_W * 0.5 * scale
-	hy := PLATE_H * 0.5 * scale
-	radius := PLATE_RADIUS * scale
-	mask_lo := 1.4 * scale
-	mask_hi := 4.6 * scale
-	center_off_x := (f32(COLUMNS) - 1) * 0.5
-	center_off_y := (f32(ROWS) - 1) * 0.5
-	for j in 0 ..< ROWS {
-		dy := (f32(j) - center_off_y) * PITCH * scale
-		for i in 0 ..< COLUMNS {
-			dx := (f32(i) - center_off_x) * PITCH * scale
-			cap := -rounded_box(dx, dy, hx, hy, radius)
-			hud.cell_mask[j * COLUMNS + i] = sstep(mask_lo, mask_hi, cap)
-		}
-	}
-	hud.mask_scale = hud.scale
-}
-
-hud_render :: proc() {
-	ensure_unpack_lut()
-	if hud.mask_scale != hud.scale { hud_bake_cell_mask() }
-	copy(hud.hi, hud.base)
-	hi := hud.hi
-
-	cx, cy := plate_center()
-	scale := hud.scale * f32(SUPERSAMPLE)
-	hx := PLATE_W * 0.5 * scale
-	hy := PLATE_H * 0.5 * scale
-	aa := 0.75 * scale
-
-	px_w := hud.w * SUPERSAMPLE
-	px_h := hud.h * SUPERSAMPLE
-
-	// Centre glow, visible while listening. Uses the baked coverage and
-	// distance; only the palette mix is live.
-	glow := max(hud.level, hud.peak * 0.6) * hud.reveal
-	if glow > 0.01 {
-		reach := (34.0 + 20.0 * glow) * scale
-		strength := 0.19 * 0.55 * min(1, glow)
-		middle := mix3(mix3(PAL_YOU, PAL_AGENT, hud.cool), mix3(PAL_YOU_CORE, PAL_AGENT_CORE, hud.cool), 0.5)
-		base_col := mix3(PAL_YOU, PAL_AGENT, hud.cool)
-		x0 := max(0, int(cx - hx - 2 * scale))
-		x1 := min(px_w - 1, int(cx + hx + 2 * scale))
-		y0 := max(0, int(cy - hy - 2 * scale))
-		y1 := min(px_h - 1, int(cy + hy + 2 * scale))
-		// The mix endpoint table is per frame, not per pixel.
-		dm := Vec3{base_col[0] - middle[0], base_col[1] - middle[1], base_col[2] - middle[2]}
-		// The baked coverage is a rounded box and the baked distance is a disc,
-		// so on each row the pixels the glow touches are one contiguous run:
-		// find its ends by scanning in from the plate box, then paint the run
-		// with no tests inside. Every pixel in the run has coverage > 0,
-		// distance < reach and weight > 0, so nothing that used to be skipped
-		// is painted.
-		for y in y0 ..= y1 {
-			row := y * px_w
-			lo := x0
-			hi_x := x1
-			for lo <= hi_x && (hud.cover[row + lo] == 0 || hud.dist[row + lo] >= reach) { lo += 1 }
-			for hi_x >= lo && (hud.cover[row + hi_x] == 0 || hud.dist[row + hi_x] >= reach) { hi_x -= 1 }
-			for x in lo ..= hi_x {
-				i := row + x
-				shape := unpack_channel(u32(hud.cover[i]))
-				d := hud.dist[i]
-				t := d / reach
-				ga := strength * (1 - t) * shape
-				gc0 := middle[0] + dm[0] * t
-				gc1 := middle[1] + dm[1] * t
-				gc2 := middle[2] + dm[2] * t
-				ng := 1 - ga
-				r, g, b, a := unpack(hi[i])
-				hi[i] = pack_unsaturated(gc0*ga + r*ng, gc1*ga + g*ng, gc2*ga + b*ng, ga + a*ng)
-			}
-		}
-	}
-
-	// Dots.
-	center_off_x := (f32(COLUMNS) - 1) * 0.5
-	center_off_y := (f32(ROWS) - 1) * 0.5
-	presence := 0.5 + 0.5 * max(hud.level, hud.reveal)
-	soft := 0.7 * hud.scale
-	base_col := mix3(PAL_YOU, PAL_AGENT, hud.cool)
-	core_col := mix3(PAL_YOU_CORE, PAL_AGENT_CORE, hud.cool)
-	for j in 0 ..< ROWS {
-		// dy, the row envelope and the floor alpha depend on the row only.
-		dy := (f32(j) - center_off_y) * PITCH * scale
-		row := abs(dy) / hy
-		floor_alpha := 0.10 * (1 - 0.7 * sstep(0.35, 0.95, row)) * presence * hud.reveal
-		for i in 0 ..< COLUMNS {
-			power := hud.power[j * COLUMNS + i]
-			fresh := hud.fresh[j * COLUMNS + i]
-
-			dx := (f32(i) - center_off_x) * PITCH * scale
-			mask := hud.cell_mask[j * COLUMNS + i]
-			if mask <= 0 { continue }
-
-			curve: f32 = 0.75
-			mix_t := curve * (1.4 + (1.0 - 1.4) * fresh)
-			alpha := floor_alpha + (1 - floor_alpha) * f32(math.pow(f64(power), f64(mix_t)))
-			dot_radius := (0.27 + 0.17 * f32(math.pow(f64(power), 0.6))) * (1.0 + (mix(0.82, 1.0, fresh) - 1.0) * sstep(0.03, 0.2, power)) * PITCH * scale
-			core := clamp(power * power * 1.1, 0, 0.9) * (0.3 + 0.7 * fresh)
-			col := mix3(base_col, core_col, core)
-
-			sx := cx + dx
-			sy := cy + dy
-			rad := dot_radius * 2.4
-
-			// Halo (the shader's wide, faint pass) then the dot body.
-			if power > 0.05 {
-				halo := 0.132 * power * power * mask * coverage(rad * 0.85, aa)
-				splat(hi, px_w, px_h, sx, sy, rad, col, halo, soft)
-			}
-			splat(hi, px_w, px_h, sx, sy, dot_radius, col, alpha * mask, soft)
-		}
-	}
-}
-
-splat :: proc(buf: []u32, bw, bh: int, cx, cy, radius: f32, col: Vec3, alpha, soft: f32) {
-	if alpha <= 0.001 { return }
-	x0 := max(0, int(cx - radius - 1))
-	x1 := min(bw - 1, int(cx + radius + 1))
-	y0 := max(0, int(cy - radius - 1))
-	y1 := min(bh - 1, int(cy + radius + 1))
-	// coverage() is zero from d == radius + soft outwards, so the square corners
-	// are rejected on squared distance: no sqrt, no divide, and no pixel that
-	// would have been painted is skipped.
-	r_out := radius + soft
-	r_out2 := r_out * r_out
-	// Inside radius - soft the smoothstep argument is already past 1, so the
-	// coverage is exactly 1: those pixels take the plain alpha and skip the
-	// sqrt and the divide. r_in2 stays negative when the dot is too small to
-	// have a full-coverage core, so the test then never matches.
-	r_in := radius - soft
-	r_in2: f32 = -1
-	if r_in > 0 { r_in2 = r_in * r_in }
-	// dx and dx*dx are the same for every row, so they are tabulated once per
-	// column block instead of being recomputed per pixel. Each pixel is still
-	// blended exactly once per call, so the result is unchanged; the block is
-	// only there so a huge radius cannot overflow the table.
-	dx2s: [SPLAT_BLOCK]f32
-	for xb := x0; xb <= x1; xb += SPLAT_BLOCK {
-		xe := min(x1, xb + SPLAT_BLOCK - 1)
-		for x in xb ..= xe {
-			dx := f32(x) + 0.5 - cx
-			dx2s[x - xb] = dx * dx
-		}
-		for y in y0 ..= y1 {
-			dy := f32(y) + 0.5 - cy
-			dy2 := dy * dy
-			for x in xb ..= xe {
-				dd := dx2s[x - xb] + dy2
-				if dd >= r_out2 { continue }
-				a: f32
-				if dd <= r_in2 {
-					a = alpha
-				} else {
-					cov := coverage(math.sqrt_f32(dd) - radius, soft)
-					if cov <= 0 { continue }
-					a = alpha * cov
-				}
-				na := 1 - a
-				idx := y*bw + x
-				dr, dg, db, da := unpack(buf[idx])
-				r := col[0] * a + dr * na
-				g := col[1] * a + dg * na
-				b := col[2] * a + db * na
-				al := a + da * na
-				buf[idx] = pack_unsaturated(r, g, b, al)
-			}
-		}
-	}
-}
-
-// Premultiplied 8-bit per channel, BGRA (little-endian DIB word).
-pack :: proc(r, g, b, a: f32) -> u32 {
-	ra := u32(clamp(r * 255, 0, 255))
-	ga := u32(clamp(g * 255, 0, 255))
-	ba := u32(clamp(b * 255, 0, 255))
-	aa := u32(clamp(a * 255, 0, 255))
-	return ba | (ga << 8) | (ra << 16) | (aa << 24)
-}
-
-// Blend loops write premultiplied channels that are already convex
-// combinations of [0,1] values, so the clamp in pack() cannot fire there:
-// this drops the four min/max pairs. The bit-exact render check proves it.
-pack_unsaturated :: proc(r, g, b, a: f32) -> u32 {
-	ra := u32(r * 255)
-	ga := u32(g * 255)
-	ba := u32(b * 255)
-	aa := u32(a * 255)
-	return ba | (ga << 8) | (ra << 16) | (aa << 24)
-}
-
-// 8-bit -> [0,1] conversion dominates the blend loops; the table holds the very
-// same f32(x)/255 values and removes four divides per pixel.
-UNPACK_LUT: [256]f32
-unpack_lut_ready: bool
-
-ensure_unpack_lut :: proc() {
-	if unpack_lut_ready { return }
-	for i in 0 ..< 256 { UNPACK_LUT[i] = f32(i) / 255.0 }
-	unpack_lut_ready = true
-}
-
-unpack_channel :: proc(v: u32) -> f32 {
-	return UNPACK_LUT[v & 0xff]
-}
-
-unpack :: proc(v: u32) -> (r, g, b, a: f32) {
-	ensure_unpack_lut()
-	return unpack_channel(v >> 16), unpack_channel(v >> 8), unpack_channel(v), unpack_channel(v >> 24)
-}
-
-// Box-downsample the supersampled frame into the DIB (premultiplied, so a
-// plain average is correct).
-hud_resolve :: proc() {
-	ss := SUPERSAMPLE
-	area := u32(ss * ss)
-	scale := u32(hud.reveal / f32(area) * 65536.0)
-	stride := hud.w * ss
-	// The DIB and the supersampled field are sized together by hud_init; bail
-	// out rather than index past either if a resize ever leaves them apart.
-	if len(hud.hi) < stride * (hud.h - 1) * ss + stride ||
-	   len(hud.pixels) < hud.w * hud.h {
-		return
-	}
-	// Hoist the slice headers and extents: with them reloaded from the global
-	// every pixel the loop cannot be vectorized, which doubled this pass.
-	hi := hud.hi
-	px := hud.pixels
-	w := hud.w
-	h := hud.h
-	#no_bounds_check {
-		for y in 0 ..< h {
-			out := y * w
-			row0 := y * ss * stride
-			for x in 0 ..< w {
-				// Two 16-bit lanes per word hold the b,g pair and the r,a pair,
-				// so four shifts and four adds per sample instead of four
-				// shift/mask pairs and four adds per channel. Each lane sums at
-				// most ss*ss*255, which cannot overflow 16 bits for any sane
-				// supersample factor, so the totals are the plain byte sums.
-				lo, hivec: u32
-				i := row0 + x * ss
-				for sy in 0 ..< ss {
-					row := i + sy * stride
-					for sx in 0 ..< ss {
-						v := hi[row + sx]
-						lo += v & 0x00FF00FF
-						hivec += (v >> 8) & 0x00FF00FF
-					}
-				}
-				bs := lo & 0xffff
-				rs := lo >> 16
-				gs := hivec & 0xffff
-				as := hivec >> 16
-				px[out + x] = ((bs * scale) >> 16) |
-					(((gs * scale) >> 16) << 8) |
-					(((rs * scale) >> 16) << 16) |
-					(((as * scale) >> 16) << 24)
-			}
-		}
-	}
 }
 
 hud_blit :: proc() {

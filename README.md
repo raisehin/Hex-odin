@@ -21,7 +21,7 @@ the encoder stages match the reference dumps at 1, 2, 4, 6 and 8 threads.
 | Q8_0 / F16 / F32 kernels (AVX2 + FMA) | working, tuned for 4C/8T Zen 2 |
 | CLI (`devices`, `record`, `transcribe`, `models`, `status`, `engine`, `threads`, `paste`, `app`) | working |
 | Capture via miniaudio (WASAPI) → mono f32 16 kHz → WAV, 2-minute ring | working |
-| HUD: port of Rune's **Dot scope** (112x26 pt plate, 43x9 dots @2.6 pt, shadow/rim/glow, braid animation, 2x supersampled) | working |
+| HUD: Rune's **Dot scope** — the real `Scope`/`Indicator` simulation plus a CPU port of `rune_hud.wgsl`'s fragment path (112x26 pt plate, 43x9 dots @2.6 pt, shadow/rim/glow, braid/processing/done) | working |
 | Global hotkeys `Ctrl+Space` dictate, `Ctrl+Alt+Q` quit; Esc cancels a recording or a transcription | working |
 | Clipboard paste + restore | working — transcript onto the clipboard, paste chord sent, old clipboard put back 500 ms later unless you copied something meanwhile. Only plain text is restored, so a copied image/file/rich text is replaced; the log names the formats dropped. `hex paste <ctrl_v\|ctrl_shift_v\|shift_insert\|type>` |
 | Silero VAD gate | working — silence never reaches the ASR (no invented "Sorry") |
@@ -168,13 +168,15 @@ Measured with the model unloaded (a dictation itself is a separate burst):
 | state | before | after |
 |---|---|---|
 | idle, HUD hidden | 1.1% of a core, 50 MB private | **0.2% of a core, 21 MB private** |
-| recording (HUD visible) | 12.0% of a core | **5.0% of a core** |
+| recording (HUD visible) | 12.0% of a core | **5.0% of a core** (old CPU stand-in; re-measure after the Dot-scope raster port) |
 | wakeups while idle | 60 Hz timer + 100 Hz pump poll | one 5 s housekeeping tick |
 
-The HUD renders at 24 fps, its plate/rim/shadow are baked once so the per-frame
-pass only does glow + dots, and the window timer is killed while hidden. The
-capture pump starts with the hotkey and is joined on release, so idle costs no
-polling. The ring is 2 minutes, not 10. Memory returns to baseline within a few
+The HUD renders at 24 fps while visible and the window timer is killed while
+hidden. Each visible frame now runs the Dot-scope simulation and one CPU pass of
+the WGSL fragment path, so the old baked plate/rim/shadow and 2x-supersample
+passes are gone; the 5.0% figure above was measured before that raster change.
+The capture pump starts with the hotkey and is joined on release, so idle costs
+no polling. The ring is 2 minutes, not 10. Memory returns to baseline within a few
 seconds of the idle release: a dictation costs ~400 MB for its duration and
 nothing while you are not using it.
 
@@ -269,7 +271,11 @@ actual GGUF is never in doubt.
 
 ```
 src/main.odin           CLI dispatch
-src/capture.odin        miniaudio capture, 2-minute lock-free ring, level meter
+src/capture.odin        miniaudio capture, 2-minute lock-free ring, raw RMS/peak meter
+src/dot_scope.odin      Dot scope simulation: springs, voice, traces, AutoLevel
+src/dot_scope_raster.odin CPU port of rune_hud.wgsl's fragment path
+src/hud_raster_bridge.odin DotFrame -> premultiplied BGRA DIB bytes
+src/hud.odin            layered window, hotkeys, tray, dictation wiring
 src/wav.odin            RIFF writer, 16-bit reader with mono downmix + resample
 src/transcribe.odin     shim loader, registry→path, engine dispatch, thread sizing
 src/phonon_engine.odin  built-in ASR engine lifecycle (phonon/ package)
@@ -300,7 +306,7 @@ dispatch shape against the naive definition.
 | `src/windows_paste.rs` | `paste.odin` |
 | `src/transcription_models.rs` | `models.odin` (data only) |
 | `src/gguf_session.rs` | `phonon/gguf.odin` + `phonon/*.odin` (engine), `native/transcribe_shim.cpp` (reference) |
-| `src/rune_hud.rs` + `rune_hud.wgsl` | `hud.odin` (DIB) |
+| `src/rune_hud.rs` + `rune_hud.wgsl` | `dot_scope.odin` + `dot_scope_raster.odin` + `hud.odin` (layered DIB) |
 | `src/rune_ui/*` (56k lines) | not ported — window/pane system |
 | `src/local_api.rs` | not ported |
 | `src/updater.rs`, release protocol | not ported |
