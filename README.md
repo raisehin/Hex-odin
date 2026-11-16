@@ -293,9 +293,14 @@ conversions use incompatible tensor names, so it is converted once:
 That pins and verifies the upstream artifact, expands it to a dense F32 GGUF
 with transcribe.cpp's own converter (driven by `scripts/convert-phonon25.py`,
 which reuses the upstream Fermion reader with the 2.5 hashes), quantises with
-`transcribe-quantize`, and drops `phonon-2.5-en-Q8_0.gguf` into
-`%APPDATA%\hex\models`. Python/torch appear only in that one-time conversion;
-loading, dictation and the GUI are Odin + C++.
+`transcribe-quantize`, verifies the result's size and SHA-256, and atomically
+installs `phonon-2.5-en-Q8_0.gguf` into `%APPDATA%\hex\models`. Python/torch
+appear only in that one-time conversion; loading, dictation and the GUI are
+Odin + C++.
+
+Run `hex models provision` to verify or install both Phonon-2.5 and the pinned
+Silero VAD (`silero-vad-v6.2-F32.gguf`) with their exact sizes and SHA-256
+hashes. It is an explicit terminal command, not part of the clean app build.
 
 Switch with `hex models use <id>`; a config pointing at a missing model falls
 back to the default instead of failing at startup. Phonon-2 was removed — same

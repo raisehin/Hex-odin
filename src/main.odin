@@ -201,7 +201,7 @@ in-flight transcription so nothing is pasted.
   hex paste [mode]        ctrl_v | ctrl_shift_v | shift_insert | type
   hex log [mode]          off (default) | stderr | file  (HEX_LOG overrides)
   hex devices             list capture endpoints and compute backends
-  hex models [list|install <id>|check <id>]
+  hex models [list|install <id>|check <id>|provision]
   hex status              resolved settings and paths
   hex version`)
 }
@@ -315,6 +315,18 @@ cmd_transcribe :: proc(path: string, model_id := "", language := "") {
 	fmt.println(text)
 }
 
+provision_models :: proc() {
+	exe_dir, _ := os.get_executable_directory(context.temp_allocator)
+	script := strings.concatenate({exe_dir, "/../scripts/provision-models.ps1"}, context.temp_allocator)
+	if !file_exists(script) {
+		fmt.eprintln("provisioning script missing:", script)
+		os.exit(1)
+	}
+	if !run_ok({"powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script}) {
+		os.exit(1)
+	}
+}
+
 cmd_models :: proc(args: []string) {
 	if len(args) == 0 || args[0] == "list" {
 		cfg := config_load()
@@ -329,6 +341,8 @@ cmd_models :: proc(args: []string) {
 	case "install":
 		if len(args) < 2 { fmt.eprintln("usage: hex models install <id>"); os.exit(2) }
 		model_install(args[1])
+	case "provision":
+		provision_models()
 	case "check":
 		if len(args) < 2 {
 			cfg := config_load()

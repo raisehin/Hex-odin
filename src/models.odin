@@ -102,7 +102,7 @@ model_install :: proc(id: string) {
 	if len(m.repo) == 0 {
 		// No public GGUF exists in transcribe.cpp's schema for this model.
 		fmt.eprintln(m.name, "has no hosted GGUF; it is built from upstream weights:")
-		fmt.eprintln("  .\\scripts\\convert-phonon25.py -Install")
+		fmt.eprintln("  .\\scripts\\fetch-phonon25.ps1 -Install")
 		os.exit(1)
 	}
 	os.make_directory(cfg.models_dir)

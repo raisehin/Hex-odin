@@ -69,8 +69,29 @@ if ($LASTEXITCODE -ne 0) { throw "transcribe-quantize failed" }
 
 if ($Install) {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Copy-Item $out (Join-Path $InstallDir (Split-Path $out -Leaf)) -Force
-    Write-Host "installed into $InstallDir" -ForegroundColor Green
+    $expected = Get-Content -Raw (Join-Path $root 'scripts\models_extra.json') | ConvertFrom-Json |
+        Where-Object { $_.id -eq 'phonon25_en' } | Select-Object -First 1
+    if (-not $expected) { throw 'phonon25_en is missing from scripts/models_extra.json' }
+    $item = Get-Item -LiteralPath $out
+    $actualSha = (Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($item.Length -ne $expected.bytes -or $actualSha -ne $expected.sha256) {
+        throw "quantized model failed verification: size=$($item.Length) expected=$($expected.bytes) sha256=$actualSha expected=$($expected.sha256)"
+    }
+    $dest = Join-Path $InstallDir (Split-Path $out -Leaf)
+    $tmp = Join-Path $InstallDir "$($expected.filename).tmp-$([guid]::NewGuid().ToString('N'))"
+    try {
+        Copy-Item -LiteralPath $out -Destination $tmp -Force
+        if (Test-Path -LiteralPath $dest -PathType Leaf) {
+            $backup = Join-Path $InstallDir "$($expected.filename).bak-$([guid]::NewGuid().ToString('N'))"
+            [IO.File]::Replace($tmp, $dest, $backup, $true)
+            Remove-Item -LiteralPath $backup -Force
+        } else {
+            Move-Item -LiteralPath $tmp -Destination $dest -Force
+        }
+    } finally {
+        if (Test-Path -LiteralPath $tmp -PathType Leaf) { Remove-Item -LiteralPath $tmp -Force }
+    }
+    Write-Host "verified and installed into $InstallDir" -ForegroundColor Green
     Write-Host "run: .\bin\hex.exe models list | findstr phonon"
 }
 
